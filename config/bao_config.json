@@ -1,0 +1,43 @@
+{
+  "thresholds": {
+    "p_accept": 0.3,
+    "p_reject": 0.7,
+    "uncertainty": 0.6
+  },
+  "costs": {
+    "c_fn": 100.0,
+    "c_fp": 1.0,
+    "c_h": 5.0,
+    "agent_costs": {
+      "agent_a": 1.0,
+      "agent_b": 5.0,
+      "agent_c": 10.0,
+      "agent_d": 20.0
+    }
+  },
+  "orchestration": {
+    "max_iterations": 2,
+    "learning_rate": 0.25,
+    "seed": 7,
+    "agent_registry_path": "agents.yaml"
+  },
+  "a2a": {
+    "retries": 0,
+    "a2a_version": "v1"
+  },
+  "state": {
+    "sqlite_path": "artifacts/state/bao_state.sqlite"
+  },
+  "voi": {
+    "use_surrogate": true,
+    "allow_exact": false
+  },
+  "drift": {
+    "window": 6,
+    "threshold": 0.08
+  },
+  "logging": {
+    "jsonl_path": "artifacts/replay/flows.jsonl",
+    "enable_mlflow": false
+  }
+}

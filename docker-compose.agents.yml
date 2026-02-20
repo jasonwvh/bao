@@ -1,0 +1,52 @@
+services:
+  agent-a:
+    build:
+      context: .
+      dockerfile: agents/agent_a_lightweight/Dockerfile
+    container_name: agent-a
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/a2a/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  agent-b:
+    build:
+      context: .
+      dockerfile: agents/agent_b_deep/Dockerfile
+    container_name: agent-b
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/a2a/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  agent-c:
+    build:
+      context: .
+      dockerfile: agents/agent_c_contextual/Dockerfile
+    container_name: agent-c
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/a2a/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  agent-d:
+    build:
+      context: .
+      dockerfile: agents/agent_d_llm/Dockerfile
+    container_name: agent-d
+    ports:
+      - "8084:8084"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8084/a2a/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

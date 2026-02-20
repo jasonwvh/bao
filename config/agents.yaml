@@ -1,0 +1,57 @@
+version: v1
+agents:
+  - id: agent_a
+    enabled: true
+    endpoint: http://agent-a:8081
+    transport: http-json
+    timeout_ms: 300
+    cost: 1.0
+    capabilities: [flow_tabular, baseline]
+    health_path: /a2a/health
+    infer_path: /a2a/infer
+    capabilities_path: /a2a/capabilities
+    meta:
+      tier: cheap
+
+  - id: agent_b
+    enabled: true
+    endpoint: http://agent-b:8082
+    transport: http-json
+    timeout_ms: 500
+    cost: 5.0
+    capabilities: [flow_tabular, uncertainty, deep_inspection]
+    health_path: /a2a/health
+    infer_path: /a2a/infer
+    capabilities_path: /a2a/capabilities
+    meta:
+      tier: deep
+
+  - id: agent_c
+    enabled: true
+    endpoint: http://agent-c:8083
+    transport: http-json
+    timeout_ms: 800
+    cost: 10.0
+    capabilities: [graph_context]
+    health_path: /a2a/health
+    infer_path: /a2a/infer
+    capabilities_path: /a2a/capabilities
+    meta: {}
+
+  - id: agent_d
+    enabled: true
+    endpoint: http://agent-d:8084
+    transport: http-json
+    timeout_ms: 1200
+    cost: 20.0
+    capabilities: [llm_reasoning]
+    health_path: /a2a/health
+    infer_path: /a2a/infer
+    capabilities_path: /a2a/capabilities
+    meta: {}
+
+routing:
+  default_agents: [agent_a, agent_b]
+  require_healthy: true
+  max_parallel: 2
+  fallback_strategy: skip_unhealthy
