@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bao"
+name = "orchestrator"
 version = "0.2.0"
-description = "BAO MVP runtime and benchmark harness"
+description = "Bayesian Agent Orchestrator runtime"
 requires-python = ">=3.10"
 dependencies = [
   "langgraph>=0.2.0",
@@ -26,8 +26,4 @@ runtime = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["bao*", "agents*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
+include = ["orchestrator*", "agents*"]

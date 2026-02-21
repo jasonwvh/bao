@@ -1,1 +1,1 @@
-"""BAO agent packages."""
+"""Agent packages."""

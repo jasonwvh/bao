@@ -1,0 +1,57 @@
+services:
+  isolation-forest:
+    build:
+      context: .
+      dockerfile: agents/isolation_forest/Dockerfile
+    container_name: isolation-forest
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./agents/isolation_forest/models:/app/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/a2a/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  autoencoder:
+    build:
+      context: .
+      dockerfile: agents/autoencoder/Dockerfile
+    container_name: autoencoder
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./agents/autoencoder/models:/app/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/a2a/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # llm:
+  #   build:
+  #     context: .
+  #     dockerfile: agents/llm/Dockerfile
+  #   container_name: llm
+  #   environment:
+  #     - OLLAMA_BASE_URL=http://host.docker.internal:11434
+  #     - OLLAMA_MODEL=qwen3
+  #   ports:
+  #     - "8084:8084"
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8084/a2a/health').read()"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+
+# volumes:
+#   ollama-data:

@@ -1,6 +1,6 @@
 # BAO (Bayesian Agent Orchestrator)
 
-Remote-first, containerized multi-agent orchestrator with a lightweight Bayesian control layer, VOI routing, and a shared state backend. All agents (A/B/C/D) run as independent HTTP services; the orchestrator connects to them via a registry in `config/agents.yaml`.
+Containerized multi-agent orchestrator with a lightweight Bayesian control layer, VOI routing, and a shared state backend. Agents run as independent HTTP services; the orchestrator connects to them via a registry in `config/agents.yaml`.
 
 **Key traits**
 - Control plane vs data plane split
@@ -25,55 +25,60 @@ flowchart LR
   end
 
   subgraph Agents["Agent Services (Containers)"]
-    A["Agent A\nLightweight"]
-    B["Agent B\nDeep"]
-    C["Agent C\nContextual"]
-    D["Agent D\nLLM Stub"]
+    IF["isolation_forest\nPort 8081"]
+    AE["autoencoder\nPort 8082"]
+    LLM["llm\nPort 8084"]
   end
 
   REG --> ORCH
   POL --> ORCH
   ORCH --> A2A
-  A2A --> A
-  A2A --> B
-  A2A --> C
-  A2A --> D
+  A2A --> IF
+  A2A --> AE
+  A2A --> LLM
   ORCH <--> STATE
 ```
 
 ## Quickstart
 
-### 1) Run agents locally (no Docker)
-Starts four HTTP services on `127.0.0.1:8081-8084` using `config/agents.local.yaml`.
-
+### 1) Train models (optional - models can be pre-built)
 ```bash
-python3 /Users/jasonwvh/Documents/projects/bao/scripts/run_local.py --startup-only
+make train
 ```
 
-### 2) Run orchestrator replay against local agents
+### 2) Build and start agents
+```bash
+make build
+make up
+```
+
+### 3) Run orchestrator replay
 Requires a labeled dataset with a `label` column.
 
 ```bash
-python3 /Users/jasonwvh/Documents/projects/bao/scripts/run_replay.py \
+python3 main.py \
   --dataset /path/to/replay.csv \
-  --config /Users/jasonwvh/Documents/projects/bao/config/bao_config.json \
+  --config config/orchestrator_config.json \
   --max-flows 1000
 ```
 
-### 3) Run agents with Docker Compose
-
+### 4) Check agent health
 ```bash
-docker compose -f /Users/jasonwvh/Documents/projects/bao/docker-compose.agents.yml up --build
+make health
 ```
 
-Orchestrator reads `config/agents.yaml` by default (container DNS names).
+### 5) Stop agents
+```bash
+make down
+```
 
-## What is `run_replay`?
-`/Users/jasonwvh/Documents/projects/bao/scripts/run_replay.py` is the offline evaluation runner. It:
-- loads a labeled replay dataset (CSV or Parquet)
-- replays flows in temporal order
-- invokes the orchestrator for each flow
-- writes JSONL artifacts under `/Users/jasonwvh/Documents/projects/bao/artifacts/replay/`
+## Agents
+
+| Agent | Port | Model | Description |
+|-------|------|-------|-------------|
+| `isolation_forest` | 8081 | sklearn IsolationForest | Lightweight anomaly detector |
+| `autoencoder` | 8082 | PyTorch Autoencoder | Deep reconstruction-based detector |
+| `llm` | 8084 | Ollama/qwen3 | LLM-based semantic triage |
 
 ## A2A HTTP Contract
 
@@ -96,7 +101,7 @@ Orchestrator reads `config/agents.yaml` by default (container DNS names).
 
 ```json
 {
-  "agent_id": "agent_a",
+  "agent_id": "isolation_forest",
   "proba": [0.7, 0.3],
   "prediction": {"label": "benign", "probability": 0.3},
   "uncertainty": {"epistemic": 0.1, "aleatoric": 0.2, "total_entropy": 0.3},
@@ -112,26 +117,29 @@ Orchestrator reads `config/agents.yaml` by default (container DNS names).
 
 ## Configuration
 
-- `/Users/jasonwvh/Documents/projects/bao/config/agents.yaml`: registry for containerized agents
-- `/Users/jasonwvh/Documents/projects/bao/config/agents.local.yaml`: registry for local dev services
-- `/Users/jasonwvh/Documents/projects/bao/config/bao_config.json`: orchestration thresholds/costs/replay/voi flags
+- `config/agents.yaml`: registry for containerized agents
+- `config/orchestrator_config.json`: orchestration thresholds/costs/replay/voi flags
 
-## Project layout (selected)
+## Project layout
 
-- `/Users/jasonwvh/Documents/projects/bao/bao/integrated_system.py`: orchestrator runtime
-- `/Users/jasonwvh/Documents/projects/bao/bao/control/registry.py`: registry loading and validation
-- `/Users/jasonwvh/Documents/projects/bao/bao/data_plane/a2a_client.py`: A2A HTTP client
-- `/Users/jasonwvh/Documents/projects/bao/bao/data_plane/state_sqlite.py`: shared SQLite state
-- `/Users/jasonwvh/Documents/projects/bao/agents/*/service.py`: A2A agent services
-- `/Users/jasonwvh/Documents/projects/bao/bao/benchmark/`: benchmark harness
-
-## Tests
-
-```bash
-python3 -m pytest -q
+```
+.
+├── main.py                          # Entry point for replay
+├── Makefile                         # Build/run commands
+├── docker-compose.agents.yml        # Agent containers
+├── config/
+│   ├── agents.yaml                  # Agent registry
+│   └── orchestrator_config.json     # Orchestrator config
+├── orchestrator/
+│   ├── integrated_system.py         # Orchestrator runtime
+│   ├── control/                     # Policy, registry, scheduler
+│   └── data_plane/                  # A2A client, state backend
+└── agents/
+    ├── isolation_forest/service.py  # IsolationForest agent
+    ├── autoencoder/service.py       # Autoencoder agent
+    └── llm/service.py               # LLM agent
 ```
 
 ## Notes
-- No local in-process inference path remains. All inference is via A2A HTTP.
-- Lightweight Bayesian updates are used in the hot path; exact VOI is off by default.
-- Benchmark harness is preserved and can be run separately from runtime replay.
+- All inference is via A2A HTTP - agents are black boxes
+- Lightweight Bayesian updates are used in the hot path; exact VOI is off by default
