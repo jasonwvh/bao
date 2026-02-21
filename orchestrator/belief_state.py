@@ -78,17 +78,40 @@ class BayesianBeliefState:
         learning_rate: float = 0.25,
         use_natural_gradient: bool = True,
     ) -> Dict[str, float]:
-        proba = agent_output.get("proba", [0.5, 0.5])
-        if isinstance(proba, (list, tuple)):
-            obs_p = float(proba[1] if len(proba) > 1 else proba[0])
+        # Prefer explicit likelihood elicitation when available: agents may return
+        # P(obs|attack) and P(obs|clean) (under key "likelihoods") or a
+        # pre-computed likelihood_ratio. Convert to log-likelihood ratio and
+        # apply as additive evidence in log-odds space.
+        obs_logit: float
+        if "likelihood_ratio" in agent_output:
+            lr = float(agent_output.get("likelihood_ratio", 1.0))
+            lr = _clip(lr, 1e-9, 1e9)
+            obs_logit = math.log(lr)
+            obs_record = lr
+        elif "likelihoods" in agent_output:
+            l = agent_output.get("likelihoods") or {}
+            p_a = float(l.get("p_obs_given_attack", l.get("p_attack", l.get("p_given_attack", 0.5))))
+            p_c = float(l.get("p_obs_given_clean", l.get("p_clean", l.get("p_given_clean", 0.5))))
+            p_a = _clip(p_a, 1e-9, 1.0)
+            p_c = _clip(p_c, 1e-9, 1.0)
+            lr = p_a / p_c if p_c > 0 else 1.0
+            lr = _clip(lr, 1e-9, 1e9)
+            obs_logit = math.log(lr)
+            obs_record = lr
         else:
-            obs_p = float(proba)
-        obs_p = _clip(obs_p, 1e-4, 1 - 1e-4)
+            proba = agent_output.get("proba", [0.5, 0.5])
+            if isinstance(proba, (list, tuple)):
+                obs_p = float(proba[1] if len(proba) > 1 else proba[0])
+            else:
+                obs_p = float(proba)
+            obs_p = _clip(obs_p, 1e-4, 1 - 1e-4)
+
+            # Convert posterior-style agent proba into a pseudo log-odds evidence
+            obs_logit = math.log(obs_p / (1.0 - obs_p))
+            obs_record = obs_p
 
         reliability, _ = self.get_reliability_estimate(agent_id)
-        # Lightweight closed-form log-odds additive update:
-        # logit(p_new) = logit(p_old) + lr * reliability * logit(obs_p)
-        obs_logit = math.log(obs_p / (1.0 - obs_p))
+        # Lightweight closed-form additive update in log-odds space.
         delta = learning_rate * reliability * obs_logit
         self.mu += delta
         self.var = _clip(self.var + learning_rate * abs(delta) * 0.02, 1e-4, 4.0)
@@ -96,7 +119,7 @@ class BayesianBeliefState:
         self.evidence_history.append(
             {
                 "agent_id": agent_id,
-                "observation": obs_p,
+                "observation": obs_record,
                 "reliability": reliability,
                 "compromise_prob": self.get_compromise_prob(),
             }

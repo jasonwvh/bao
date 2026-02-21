@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -16,6 +17,18 @@ if str(REPO_ROOT) not in sys.path:
 
 from orchestrator.data.replay import load_replay_dataset
 from orchestrator.integrated_system import IntegratedBAOSystem
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """Configure logging for orchestrator and agents."""
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Ensure orchestrator and agent loggers are enabled
+    for logger_name in ["orchestrator", "autoencoder", "isolation_forest", "llm"]:
+        logging.getLogger(logger_name).setLevel(level)
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +95,7 @@ async def _run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    setup_logging()
     asyncio.run(_run(args))
 
 

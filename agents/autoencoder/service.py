@@ -37,7 +37,7 @@ class AutoencoderModel(nn.Module):
 
 
 class Autoencoder:
-    def __init__(self, model_path: str | Path, cost: float = 2.0):
+    def __init__(self, model_path: str | Path, cost: float = 5.0):
         self.agent_id = "autoencoder"
         self.cost = float(cost)
         self.model_path = Path(model_path)
@@ -107,7 +107,7 @@ class Autoencoder:
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "autoencoder.pt")
 AGENT = Autoencoder(
     model_path=os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH),
-    cost=float(os.getenv("AGENT_COST", "2.0")),
+    cost=float(os.getenv("AGENT_COST", "2.5")),
 )
 
 

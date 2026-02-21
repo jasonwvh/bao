@@ -95,11 +95,17 @@ class DecisionThresholds:
             return "accept"
         if p_mal > self.p_reject:
             return "reject"
+        # In gray zone [p_accept, p_reject]
         if uncertainty >= self.uncertainty:
             if has_more_agents:
                 return "more_agents"
             return "defer"
-        return "defer"
+        if has_more_agents:
+            return "more_agents"
+        # Agents exhausted, low uncertainty in gray zone: make best guess
+        if p_mal < 0.5:
+            return "accept"
+        return "reject"
 
 
 class FullBAOState(TypedDict, total=False):

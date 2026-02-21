@@ -69,9 +69,9 @@ class IntegratedBAOSystem:
         self.voi_router = VOIRouter(
             agents={aid: self.agent_handles[aid] for aid in self.default_agents},
             observation_models=self.calibrator.models,
-            c_fn=float(costs.get("c_fn", 100.0)),
-            c_fp=float(costs.get("c_fp", 1.0)),
-            c_h=float(costs.get("c_h", 5.0)),
+            c_fn=float(costs.get("c_fn", 1000000.0)),
+            c_fp=float(costs.get("c_fp", 50.0)),
+            c_h=float(costs.get("c_h", 100000.0)),
             use_surrogate=bool(self.config.get("voi", {}).get("use_surrogate", True)),
             allow_exact=bool(self.config.get("voi", {}).get("allow_exact", False)),
         )
@@ -224,11 +224,14 @@ class IntegratedBAOSystem:
         state["selected_agent"] = None
         state["selected_voi"] = None
         state["iteration"] = 0
-        state["max_iterations"] = int(self.config.get("orchestration", {}).get("max_iterations", 2))
+        # Exhaust all agents before human deferral (high cost of human review)
+        max_agents = len(state["agents_available"])
+        state["max_iterations"] = int(self.config.get("orchestration", {}).get("max_iterations", max_agents))
 
-        state["belief_mu"] = 0.0
+        # Prior: 0.1% base attack rate (logit(0.001) = -6.907)
+        state["belief_mu"] = 0
         state["belief_var"] = 1.0
-        state["compromise_prob"] = 0.5
+        state["compromise_prob"] = 0.1
         state["epistemic_uncertainty"] = 0.69314718056
         state["agent_reliabilities"] = {}
 
@@ -285,18 +288,32 @@ class IntegratedBAOSystem:
         if state["iteration"] == 0 and not state["agents_queried"] and state["agents_available"]:
             return "query"
         if state["iteration"] >= state["max_iterations"]:
-            logging.info("[MAX_ITERATIONS] flow_id=%s, iteration=%d >= max=%d", 
-                        state["flow_id"], state["iteration"], state["max_iterations"])
+            logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, reached max iterations (%d), stopping with MULTIPLE agents: %s", 
+                        state["flow_id"], state["max_iterations"], state["agents_queried"])
             return "check"
         if not state["voi_scores"]:
+            logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, no more agents available, stopping with: %s", 
+                        state["flow_id"], state["agents_queried"])
             return "check"
-        if max(state["voi_scores"].values()) > 0:
-            best_agent = max(state["voi_scores"], key=state["voi_scores"].get)
-            best_voi = state["voi_scores"][best_agent]
-            logging.info("[VOI_POSITIVE] flow_id=%s, selecting agent=%s, voi=%.4f", 
-                        state["flow_id"], best_agent, best_voi)
+        
+        best_agent = max(state["voi_scores"], key=state["voi_scores"].get)
+        best_voi = state["voi_scores"][best_agent]
+        
+        if best_voi > 0:
+            if state["iteration"] == 1:
+                logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, VOI=%.4f > 0 after 1 agent, deciding to use MULTIPLE agents. Next: %s", 
+                            state["flow_id"], best_voi, best_agent)
+            else:
+                logging.info("[VOI_POSITIVE] flow_id=%s, iteration=%d, selecting next agent=%s, voi=%.4f", 
+                            state["flow_id"], state["iteration"], best_agent, best_voi)
             return "query"
-        logging.info("[VOI_NEGATIVE] flow_id=%s, all voi_scores <= 0", state["flow_id"])
+        
+        if state["iteration"] == 1:
+            logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, VOI <= 0 after 1 agent, deciding to use SINGLE agent: %s", 
+                        state["flow_id"], state["agents_queried"])
+        else:
+            logging.info("[VOI_NEGATIVE] flow_id=%s, stopping after %d agents: %s", 
+                        state["flow_id"], state["iteration"], state["agents_queried"])
         return "check"
 
     async def _select_agent(self, state: FullBAOState) -> FullBAOState:
@@ -329,6 +346,7 @@ class IntegratedBAOSystem:
                     "uncertainty": state["epistemic_uncertainty"],
                 },
                 "requested_capabilities": state["flow_features"].get("required_capabilities", []),
+                "elicit_likelihood": True,
                 "seed": int(self.config.get("orchestration", {}).get("seed", 0)),
             },
         }
@@ -338,6 +356,19 @@ class IntegratedBAOSystem:
 
         try:
             output = self.a2a.infer(handle, payload)
+            # If the agent provided elicited likelihoods, convert to a posterior proba
+            if isinstance(output, dict) and output.get("likelihoods"):
+                l = output.get("likelihoods") or {}
+                p_a = float(l.get("p_obs_given_attack", l.get("p_attack", l.get("p_given_attack", 0.5))))
+                p_c = float(l.get("p_obs_given_clean", l.get("p_clean", l.get("p_given_clean", 0.5))))
+                p_a = max(1e-9, min(1.0, p_a))
+                p_c = max(1e-9, min(1.0, p_c))
+                prior = float(state.get("compromise_prob", 0.001))
+                denom = prior * p_a + (1.0 - prior) * p_c
+                posterior = prior if denom <= 0 else (prior * p_a) / denom
+                posterior = max(1e-6, min(1.0 - 1e-6, posterior))
+                output["proba"] = [1.0 - posterior, posterior]
+                output["_elicited_likelihoods"] = {"p_obs_given_attack": p_a, "p_obs_given_clean": p_c}
             logging.info("[AGENT_RESPONSE] flow_id=%s, agent=%s, proba=%s, cost=%.2f", 
                         state["flow_id"], aid, output.get("proba"), float(handle.cost))
         except A2AClientError:
@@ -477,6 +508,12 @@ class IntegratedBAOSystem:
         has_more_agents = len(remaining_agents) > 0 and state["iteration"] < state["max_iterations"]
         decision = local_thresholds.decide(p, h, has_more_agents=has_more_agents)
         
+        # Summary of agent usage strategy
+        num_queried = len(state["agents_queried"])
+        agent_strategy = "single-agent" if num_queried == 1 else "multi-agent" if num_queried > 1 else "no-agent"
+        logging.info("[ORCHESTRATOR_STRATEGY] flow_id=%s, strategy=%s, agents=%s, final_p_mal=%.4f, final_uncertainty=%.4f", 
+                    state["flow_id"], agent_strategy, state["agents_queried"], p, h)
+
         logging.info("[DECISION] flow_id=%s, decision=%s, p_mal=%.4f, uncertainty=%.4f, has_more_agents=%s, iteration=%d/%d", 
                     state["flow_id"], decision, p, h, has_more_agents, state["iteration"], state["max_iterations"])
         
