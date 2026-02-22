@@ -13,9 +13,9 @@ class VOIRouter:
         self,
         agents: Dict[str, Any],
         observation_models: Dict[str, Any],
-        c_fn: float = 1000000.0,  # Cost of false negative: letting hacker in ($1M)
-        c_fp: float = 50.0,       # Cost of false positive: blocking safe user ($50)
-        c_h: float = 100000.0,     # Cost of human deferral: expensive analyst time ($100k)
+        c_fn: float = 50.0,  # Cost of false negative: letting hacker in ($1M)
+        c_fp: float = 5.0,       # Cost of false positive: blocking safe user ($50)
+        c_h: float = 500.0,     # Cost of human deferral: expensive analyst time ($100k)
         use_surrogate: bool = True,
         allow_exact: bool = False,
         capability_filter: Optional[Callable[[List[str], Dict[str, Any]], List[str]]] = None,
@@ -110,7 +110,7 @@ class VOIRouter:
 
     def _update_surrogate(self, features: np.ndarray, voi_value: float) -> None:
         self._surrogate_samples.append((features, voi_value))
-        if len(self._surrogate_samples) < 24:
+        if len(self._surrogate_samples) < 256:  # Increased from 24
             return
         xs = np.stack([s[0] for s in self._surrogate_samples[-512:]])
         ys = np.array([s[1] for s in self._surrogate_samples[-512:]], dtype=float)
@@ -132,10 +132,24 @@ class VOIRouter:
         for aid in available:
             score = self.estimate_voi(aid, belief_state, flow_features)
             voi_scores[aid] = score
-            self._update_surrogate(self._features(aid, belief_state, flow_features), score)
-
+            
+            # Ground truth for training
+            exact_ground_truth_voi = self.estimate_voi_exact(aid, belief_state, flow_features)
+            self._update_surrogate(self._features(aid, belief_state, flow_features), exact_ground_truth_voi)
+    
         best = max(voi_scores, key=voi_scores.get)
         best_voi = voi_scores[best]
+        
+        exploration_rate = 0.1
+        rng = np.random.default_rng()
+        
         if best_voi <= 0:
+            # EXPLORATION FIX: If we decide to explore, we must return a positive 
+            # VOI so the calling orchestrator loop doesn't immediately discard it.
+            if rng.random() <= exploration_rate:
+                return best, 0.01, voi_scores 
+            
+            # If not exploring, behave normally
             return None, None, voi_scores
+            
         return best, best_voi, voi_scores

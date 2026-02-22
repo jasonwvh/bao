@@ -107,7 +107,7 @@ class Autoencoder:
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "autoencoder.pt")
 AGENT = Autoencoder(
     model_path=os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH),
-    cost=float(os.getenv("AGENT_COST", "2.5")),
+    cost=float(os.getenv("AGENT_COST", "2.0")),
 )
 
 

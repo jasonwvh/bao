@@ -18,7 +18,7 @@ agents:
     endpoint: http://localhost:8082
     transport: http-json
     timeout_ms: 1200
-    cost: 2.5
+    cost: 2.0
     capabilities: [flow_tabular, unsw_nb15, deep_inspection, anomaly_score]
     health_path: /a2a/health
     infer_path: /a2a/infer
@@ -42,5 +42,5 @@ agents:
 routing:
   default_agents: [isolation_forest, autoencoder]
   require_healthy: true
-  max_parallel: 2
+  max_parallel: 1
   fallback_strategy: skip_unhealthy

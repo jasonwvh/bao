@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import time
 import uuid
 from pathlib import Path
@@ -69,9 +70,9 @@ class IntegratedBAOSystem:
         self.voi_router = VOIRouter(
             agents={aid: self.agent_handles[aid] for aid in self.default_agents},
             observation_models=self.calibrator.models,
-            c_fn=float(costs.get("c_fn", 1000000.0)),
-            c_fp=float(costs.get("c_fp", 50.0)),
-            c_h=float(costs.get("c_h", 100000.0)),
+            c_fn=float(costs.get("c_fn", 50.0)),
+            c_fp=float(costs.get("c_fp", 5.0)),
+            c_h=float(costs.get("c_h", 500.0)),
             use_surrogate=bool(self.config.get("voi", {}).get("use_surrogate", True)),
             allow_exact=bool(self.config.get("voi", {}).get("allow_exact", False)),
         )
@@ -230,16 +231,25 @@ class IntegratedBAOSystem:
         state["voi_scores"] = {}
         state["selected_agent"] = None
         state["selected_voi"] = None
+        state["voi_should_query"] = True
         state["iteration"] = 0
         # Exhaust all agents before human deferral (high cost of human review)
         max_agents = len(state["agents_available"])
         state["max_iterations"] = int(self.config.get("orchestration", {}).get("max_iterations", max_agents))
 
         # Prior: 0.1% base attack rate (logit(0.001) = -6.907)
-        state["belief_mu"] = 0
+        
+        base_attack_rate = 0.1
+        state["compromise_prob"] = base_attack_rate
+        state["belief_mu"] = math.log(base_attack_rate / (1.0 - base_attack_rate))
         state["belief_var"] = 1.0
-        state["compromise_prob"] = 0.1
-        state["epistemic_uncertainty"] = 0.69314718056
+        # state["epistemic_uncertainty"] = 0.69314718056
+        p = state["compromise_prob"]
+        if p in (0.0, 1.0):
+            state["epistemic_uncertainty"] = 0.0
+        else:
+            # Binary cross-entropy in nats
+            state["epistemic_uncertainty"] = -(p * math.log(p) + (1 - p) * math.log(1 - p))
         state["agent_reliabilities"] = {}
 
         state["drift_detected"] = False
@@ -278,13 +288,13 @@ class IntegratedBAOSystem:
         requested_caps = list(state["flow_features"].get("required_capabilities", []))
         candidate_agents = filter_by_capability(state["agents_available"], self.agent_handles, requested_caps)
 
-        _, _, scores = self.voi_router.select_best_agent(
+        best_agent, best_voi, scores = self.voi_router.select_best_agent(
             belief_state=belief,
             flow_features=state["flow_features"],
             queried_agents=[a for a in state["agents_queried"] if a in candidate_agents],
         )
-        # Ensure only currently available/capable agents are retained
         state["voi_scores"] = {aid: s for aid, s in scores.items() if aid in candidate_agents}
+        state["voi_should_query"] = best_agent is not None
         state["inference_time_ms"] += (time.perf_counter() - t0) * 1000.0
         return state
 
@@ -306,9 +316,9 @@ class IntegratedBAOSystem:
         best_agent = max(state["voi_scores"], key=state["voi_scores"].get)
         best_voi = state["voi_scores"][best_agent]
         
-        if best_voi > 0:
+        if state.get("voi_should_query", False):
             if state["iteration"] == 1:
-                logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, VOI=%.4f > 0 after 1 agent, deciding to use MULTIPLE agents. Next: %s", 
+                logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, VOI=%.4f (exploration) after 1 agent, deciding to use MULTIPLE agents. Next: %s", 
                             state["flow_id"], best_voi, best_agent)
             else:
                 logging.info("[VOI_POSITIVE] flow_id=%s, iteration=%d, selecting next agent=%s, voi=%.4f", 

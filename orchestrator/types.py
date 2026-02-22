@@ -120,6 +120,7 @@ class FullBAOState(TypedDict, total=False):
     voi_scores: Dict[str, float]
     selected_agent: Optional[str]
     selected_voi: Optional[float]
+    voi_should_query: bool
     iteration: int
     max_iterations: int
 
