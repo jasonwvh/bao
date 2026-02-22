@@ -202,10 +202,17 @@ class IntegratedBAOSystem:
 
         workflow.add_edge("consensus", "make_decision")
 
+        def _route_after_decision(s: FullBAOState) -> str:
+            if s["decision"] == "defer":
+                return "defer"
+            if s["decision"] == "more_agents":
+                return "more_agents"
+            return "act"
+
         workflow.add_conditional_edges(
             "make_decision",
-            lambda s: "defer" if s["decision"] == "defer" else "act",
-            {"defer": "defer_hitl", "act": "execute_action"},
+            _route_after_decision,
+            {"defer": "defer_hitl", "more_agents": "compute_voi", "act": "execute_action"},
         )
 
         workflow.add_edge("defer_hitl", "collect_feedback")
@@ -445,9 +452,12 @@ class IntegratedBAOSystem:
     def _route_after_drift(self, state: FullBAOState) -> str:
         if state["needs_calibration"]:
             return "calibrate"
-        if state["iteration"] < state["max_iterations"]:
-            if state.get("voi_scores") and max(state["voi_scores"].values()) > 0:
-                return "loop"
+        remaining = [a for a in state["agents_available"] if a not in state["agents_queried"]]
+        # Always recompute VOI with the updated belief after each agent call.
+        # Let _route_after_voi be the single decision point on whether to query more.
+        # Never use stale voi_scores here to gate the loop.
+        if state["iteration"] < state["max_iterations"] and remaining:
+            return "loop"
         return "check"
 
     async def _calibrate(self, state: FullBAOState) -> FullBAOState:
@@ -505,7 +515,10 @@ class IntegratedBAOSystem:
                 )
 
         remaining_agents = [a for a in state["agents_available"] if a not in state["agents_queried"]]
-        has_more_agents = len(remaining_agents) > 0 and state["iteration"] < state["max_iterations"]
+        # If we've reached make_decision, _route_after_voi already determined no further
+        # queries are worth it. has_more_agents is always False here to avoid more_agents
+        # cycling back into a VOI check that will just return "check" again.
+        has_more_agents = False
         decision = local_thresholds.decide(p, h, has_more_agents=has_more_agents)
         
         # Summary of agent usage strategy
@@ -609,7 +622,10 @@ class IntegratedBAOSystem:
             "timestamp": timestamp,
             "true_label": true_label,
         }
-        return await self.graph.ainvoke(init_state)
+        return await self.graph.ainvoke(
+            init_state,
+            config={"recursion_limit": max(50, len(self.default_agents) * 20)},
+        )
 
     def get_system_statistics(self) -> Dict[str, Any]:
         n = max(1, self.metrics["flows_processed"])

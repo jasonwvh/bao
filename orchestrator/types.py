@@ -100,8 +100,8 @@ class DecisionThresholds:
             if has_more_agents:
                 return "more_agents"
             return "defer"
-        if has_more_agents:
-            return "more_agents"
+        # if has_more_agents:
+        #     return "more_agents"
         # Agents exhausted, low uncertainty in gray zone: make best guess
         if p_mal < 0.5:
             return "accept"

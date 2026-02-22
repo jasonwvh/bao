@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from benchmark.metrics import compute_metrics
 from orchestrator.data.replay import load_replay_dataset
 from orchestrator.integrated_system import IntegratedBAOSystem
 
@@ -66,6 +67,11 @@ async def _run(args: argparse.Namespace) -> None:
     if results_path.exists():
         results_path.unlink()
 
+    predictions: list[int] = []
+    labels: list[int] = []
+    probabilities: list[float] = []
+    costs: list[float] = []
+
     for row in rows:
         res = await system.process_flow(
             flow_features=row["flow_features"],
@@ -84,9 +90,29 @@ async def _run(args: argparse.Namespace) -> None:
         with open(results_path, "a") as f:
             f.write(json.dumps(compact) + "\n")
 
+        true_label = row.get("true_label")
+        if true_label is not None:
+            labels.append(int(true_label))
+            p_mal = float(res.get("compromise_prob", 0.5))
+            probabilities.append(p_mal)
+            predictions.append(1 if p_mal >= 0.5 else 0)
+            costs.append(float(res.get("cumulative_cost", 0.0)))
+
     summary = system.get_system_statistics()
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
+
+    if labels:
+        benchmark_metrics = compute_metrics(
+            predictions=predictions,
+            labels=labels,
+            probabilities=probabilities,
+            costs=costs,
+            approach="bao",
+        )
+        benchmark_path = output_dir / "benchmark_bao.json"
+        benchmark_path.write_text(json.dumps(benchmark_metrics, indent=2))
+        print(f"Benchmark metrics: {benchmark_path}")
 
     print(f"Processed {summary['flows_processed']} flows")
     print(f"Replay output: {results_path}")
