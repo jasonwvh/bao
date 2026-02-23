@@ -45,13 +45,6 @@ class IntegratedBAOSystem:
             backend=self.state_backend,
         )
         self.calibrator = ObservationModelCalibrator()
-        schema_path = self.config.get("preprocessing", {}).get("schema_path")
-        if schema_path:
-            p = Path(schema_path)
-            if not p.is_absolute():
-                p = (self.config_path.parent / p).resolve()
-            schema_path = str(p)
-        self.preprocessor = OrchestratorPreprocessor(schema_path=schema_path)
 
         registry_path = self._resolve_registry_path()
         registry = load_registry(registry_path)
@@ -83,10 +76,14 @@ class IntegratedBAOSystem:
             c_h=float(costs.get("c_h", 500.0)),
             use_surrogate=bool(self.config.get("voi", {}).get("use_surrogate", True)),
             allow_exact=bool(self.config.get("voi", {}).get("allow_exact", False)),
-            lazy_exact_interval=int(self.config.get("voi", {}).get("lazy_exact_interval", 100)),
-            exact_uncertainty_trigger=float(self.config.get("voi", {}).get("exact_uncertainty_trigger", 0.85)),
-            cache_bins=int(self.config.get("voi", {}).get("cache_bins", 64)),
         )
+
+        # Initialize preprocessor with schema from config
+        pre_cfg = self.config.get("preprocessing", {})
+        schema_path = pre_cfg.get("schema_path")
+        if schema_path and not Path(schema_path).is_absolute():
+            schema_path = (self.config_path.parent / schema_path).resolve()
+        self.preprocessor = OrchestratorPreprocessor(schema_path=schema_path)
 
         self.metrics = {
             "flows_processed": 0,
@@ -250,7 +247,7 @@ class IntegratedBAOSystem:
 
         # Prior: 0.1% base attack rate (logit(0.001) = -6.907)
         
-        base_attack_rate = 0.1
+        base_attack_rate = 0.55
         state["compromise_prob"] = base_attack_rate
         state["belief_mu"] = math.log(base_attack_rate / (1.0 - base_attack_rate))
         state["belief_var"] = 1.0
@@ -437,7 +434,7 @@ class IntegratedBAOSystem:
         updated = belief.variational_update(
             output,
             agent_id=agent_id,
-            learning_rate=float(self.config.get("orchestration", {}).get("learning_rate", 0.25)),
+            learning_rate=float(self.config.get("orchestration", {}).get("learning_rate", 1.0)),
             use_natural_gradient=False,
         )
         self.belief_manager.persist_belief(state["flow_id"])
@@ -637,10 +634,11 @@ class IntegratedBAOSystem:
         timestamp: float,
         true_label: Optional[int] = None,
     ) -> Dict[str, Any]:
-        prepared_features = self.preprocessor.transform(flow_features)
+        # Preprocess features if preprocessor is configured
+        preprocessed_features = self.preprocessor.transform(flow_features) if self.preprocessor else flow_features
         init_state: FullBAOState = {
             "flow_id": flow_id,
-            "flow_features": prepared_features,
+            "flow_features": preprocessed_features,
             "timestamp": timestamp,
             "true_label": true_label,
         }

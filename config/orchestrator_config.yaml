@@ -1,16 +1,16 @@
 thresholds:
-  p_accept: 0.30
-  p_reject: 0.70
+  p_accept: 0.45
+  p_reject: 0.55
   uncertainty: 0.85
 
 costs:
-  c_fn: 50.0
+  c_fn: 500.0
   c_fp: 5.0
   c_h: 5000.0
 
 orchestration:
-  max_iterations: 3
-  learning_rate: 0.35
+  max_iterations: 2
+  learning_rate: 1.0
   seed: 7
   agent_registry_path: agents.yaml
 
@@ -27,9 +27,6 @@ state:
 voi:
   use_surrogate: true
   allow_exact: true
-  lazy_exact_interval: 100
-  exact_uncertainty_trigger: 0.85
-  cache_bins: 64
 
 drift:
   window: 20

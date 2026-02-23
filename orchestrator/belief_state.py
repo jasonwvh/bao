@@ -43,7 +43,7 @@ class BayesianBeliefState:
         self.drift_threshold = float(drift_threshold)
 
         self.agent_reliabilities: Dict[str, Dict[str, float]] = defaultdict(
-            lambda: {"alpha": 1.0, "beta": 1.0}
+            lambda: {"alpha": 2.0, "beta": 1.0}
         )
         self.evidence_history: list[Dict[str, Any]] = []
         self._entropy_history: Deque[float] = deque(maxlen=self.drift_window * 2)
@@ -75,7 +75,7 @@ class BayesianBeliefState:
         self,
         agent_output: Dict[str, Any],
         agent_id: str,
-        learning_rate: float = 0.25,
+        learning_rate: float = 1.0,
         use_natural_gradient: bool = True,
     ) -> Dict[str, float]:
         # Prefer explicit likelihood elicitation when available: agents may return
@@ -111,10 +111,11 @@ class BayesianBeliefState:
             obs_record = obs_p
 
         reliability, _ = self.get_reliability_estimate(agent_id)
-        # Lightweight closed-form additive update in log-odds space.
-        delta = learning_rate * reliability * obs_logit
+        # Closed-form variational update: move mu toward observation logit
+        # proportional to reliability and learning rate.
+        delta = learning_rate * reliability * (obs_logit - self.mu)
         self.mu += delta
-        self.var = _clip(self.var + learning_rate * abs(delta) * 0.02, 1e-4, 4.0)
+        self.var = _clip(self.var + learning_rate * abs(delta) * 0.03, 1e-4, 4.0)
 
         self.evidence_history.append(
             {
@@ -186,7 +187,7 @@ class BeliefStateManager:
         self.beliefs: Dict[str, BayesianBeliefState] = {}
         self.backend = backend
         self.global_agent_reliabilities: Dict[str, Dict[str, float]] = defaultdict(
-            lambda: {"alpha": 1.0, "beta": 1.0}
+            lambda: {"alpha": 2.0, "beta": 1.0}
         )
         self._drift_window = drift_window
         self._drift_threshold = drift_threshold
