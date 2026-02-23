@@ -6,13 +6,16 @@ thresholds:
 costs:
   c_fn: 50.0
   c_fp: 5.0
-  c_h: 500.0
+  c_h: 5000.0
 
 orchestration:
-  max_iterations: 2
+  max_iterations: 3
   learning_rate: 0.35
   seed: 7
   agent_registry_path: agents.yaml
+
+preprocessing:
+  schema_path: ../agents/lstm_autoencoder/models/lstm_autoencoder.schema.json
 
 a2a:
   retries: 0
@@ -23,7 +26,10 @@ state:
 
 voi:
   use_surrogate: true
-  allow_exact: false
+  allow_exact: true
+  lazy_exact_interval: 100
+  exact_uncertainty_trigger: 0.85
+  cache_bins: 64
 
 drift:
   window: 20

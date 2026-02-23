@@ -28,7 +28,7 @@ def setup_logging(level: int = logging.INFO) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     # Ensure orchestrator and agent loggers are enabled
-    for logger_name in ["orchestrator", "autoencoder", "isolation_forest", "llm"]:
+    for logger_name in ["orchestrator", "lstm_autoencoder", "ocsvm", "wgan_gp"]:
         logging.getLogger(logger_name).setLevel(level)
 
 

@@ -16,11 +16,11 @@ from benchmark.metrics import compute_metrics
 from orchestrator.data.replay import load_replay_dataset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("if_benchmark")
+logger = logging.getLogger("ae_benchmark")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Benchmark Isolation Forest agent")
+    p = argparse.ArgumentParser(description="Benchmark LSTM Autoencoder agent")
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv", help="CSV or parquet dataset")
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
@@ -37,11 +37,11 @@ def main() -> None:
 
     model_path = args.model_path
     if model_path is None:
-        model_path = os.path.join(os.path.dirname(__file__), "models", "isolation_forest.pkl")
+        model_path = os.path.join(os.path.dirname(__file__), "models", "lstm_autoencoder.pt")
 
-    from agents.isolation_forest.service import IsolationForestAgent
+    from agents.lstm_autoencoder.service import LSTMAutoencoderAgent
 
-    agent = IsolationForestAgent(model_path=model_path, cost=args.cost)
+    agent = LSTMAutoencoderAgent(model_path=model_path, cost=args.cost)
 
     rows = load_replay_dataset(args.dataset, max_rows=(args.max_flows or None))
     if not rows:
@@ -57,7 +57,7 @@ def main() -> None:
         if true_label is None:
             continue
 
-        output = agent.predict_with_uncertainty(row["flow_features"])
+        output = agent.predict_with_uncertainty(row["flow_features"], flow_id=row.get("flow_id"))
         p_mal = float(output["proba"][1])
         pred = 1 if p_mal >= 0.5 else 0
 
@@ -79,10 +79,10 @@ def main() -> None:
         labels=labels,
         probabilities=probabilities,
         costs=costs,
-        approach="isolation_forest",
+        approach="lstm_autoencoder",
     )
 
-    benchmark_path = output_dir / "benchmark_isolation_forest.json"
+    benchmark_path = output_dir / "benchmark_lstm_autoencoder.json"
     benchmark_path.write_text(json.dumps(metrics, indent=2))
 
     print(f"Processed {metrics['flows_processed']} flows")

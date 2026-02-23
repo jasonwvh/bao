@@ -1,46 +1,46 @@
 version: v1
 agents:
-  - id: isolation_forest
+  - id: ocsvm
     enabled: true
     endpoint: http://localhost:8081
     transport: http-json
-    timeout_ms: 600
+    timeout_ms: 1500
     cost: 1.0
-    capabilities: [flow_tabular, unsw_nb15, anomaly_score]
+    capabilities: [flow_tabular, unsw_nb15, anomaly_score, one_class]
     health_path: /a2a/health
     infer_path: /a2a/infer
     capabilities_path: /a2a/capabilities
     meta:
       tier: cheap
 
-  - id: autoencoder
+  - id: lstm_autoencoder
     enabled: true
     endpoint: http://localhost:8082
     transport: http-json
-    timeout_ms: 1200
-    cost: 2.0
-    capabilities: [flow_tabular, unsw_nb15, deep_inspection, anomaly_score]
+    timeout_ms: 1800
+    cost: 3.0
+    capabilities: [flow_tabular, unsw_nb15, anomaly_score, temporal]
     health_path: /a2a/health
     infer_path: /a2a/infer
     capabilities_path: /a2a/capabilities
     meta:
       tier: deep
 
-  # - id: llm
-  #   enabled: true
-  #   endpoint: http://localhost:8084
-  #   transport: http-json
-  #   timeout_ms: 5000
-  #   cost: 20.0
-  #   capabilities: [llm_reasoning, semantic_triage, qwen3]
-  #   health_path: /a2a/health
-  #   infer_path: /a2a/infer
-  #   capabilities_path: /a2a/capabilities
-  #   meta:
-  #     tier: llm
+  - id: wgan_gp
+    enabled: true
+    endpoint: http://localhost:8084
+    transport: http-json
+    timeout_ms: 2200
+    cost: 5.0
+    capabilities: [flow_tabular, unsw_nb15, anomaly_score, generative_anomaly]
+    health_path: /a2a/health
+    infer_path: /a2a/infer
+    capabilities_path: /a2a/capabilities
+    meta:
+      tier: gan
 
 routing:
-  default_agents: [isolation_forest, autoencoder]
+  default_agents: [lstm_autoencoder, ocsvm, wgan_gp]
   require_healthy: true
   max_parallel: 1
   fallback_strategy: skip_unhealthy

@@ -25,9 +25,9 @@ flowchart LR
   end
 
   subgraph Agents["Agent Services (Containers)"]
-    IF["isolation_forest\nPort 8081"]
-    AE["autoencoder\nPort 8082"]
-    LLM["llm\nPort 8084"]
+    IF["ocsvm\nPort 8081"]
+    AE["lstm_autoencoder\nPort 8082"]
+    LLM["wgan_gp\nPort 8084"]
   end
 
   REG --> ORCH
@@ -76,9 +76,9 @@ make down
 
 | Agent | Port | Model | Description |
 |-------|------|-------|-------------|
-| `isolation_forest` | 8081 | sklearn IsolationForest | Lightweight anomaly detector |
-| `autoencoder` | 8082 | PyTorch Autoencoder | Deep reconstruction-based detector |
-| `llm` | 8084 | Ollama/qwen3 | LLM-based semantic triage |
+| `ocsvm` | 8081 | sklearn One-Class SVM | Lightweight one-class anomaly detector |
+| `lstm_autoencoder` | 8082 | PyTorch Hybrid LSTM Autoencoder | Temporal reconstruction anomaly detector |
+| `wgan_gp` | 8084 | PyTorch WGAN-GP | Generative anomaly detector |
 
 ## A2A HTTP Contract
 
@@ -101,7 +101,7 @@ make down
 
 ```json
 {
-  "agent_id": "isolation_forest",
+  "agent_id": "ocsvm",
   "proba": [0.7, 0.3],
   "prediction": {"label": "benign", "probability": 0.3},
   "uncertainty": {"epistemic": 0.1, "aleatoric": 0.2, "total_entropy": 0.3},
@@ -135,9 +135,9 @@ make down
 │   ├── control/                     # Policy, registry, scheduler
 │   └── data_plane/                  # A2A client, state backend
 └── agents/
-    ├── isolation_forest/service.py  # IsolationForest agent
-    ├── autoencoder/service.py       # Autoencoder agent
-    └── llm/service.py               # LLM agent
+    ├── ocsvm/service.py             # One-Class SVM agent
+    ├── lstm_autoencoder/service.py  # Hybrid LSTM autoencoder agent
+    └── wgan_gp/service.py           # WGAN-GP agent
 ```
 
 ## Notes

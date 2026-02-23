@@ -4,7 +4,7 @@ theme: default
 paginate: true
 ---
 
-# Bayesian Agent Orchestrator for Network Intrusion Detection Systems
+# Bayesian Agent Orchestrator
 
 ---
 

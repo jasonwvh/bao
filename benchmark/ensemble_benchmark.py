@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
 from pathlib import Path
@@ -15,19 +14,18 @@ if str(REPO_ROOT) not in sys.path:
 from benchmark.metrics import compute_metrics
 from orchestrator.data.replay import load_replay_dataset
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("ensemble_benchmark")
-
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Benchmark Ensemble (IF + AE) with simple average fusion")
+    p = argparse.ArgumentParser(description="Benchmark Ensemble (OCSVM + LSTM-AE + WGAN-GP)")
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv", help="CSV or parquet dataset")
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
-    p.add_argument("--if-model-path", default=None, help="Path to Isolation Forest model")
-    p.add_argument("--ae-model-path", default=None, help="Path to Autoencoder model")
-    p.add_argument("--if-cost", type=float, default=1.0, help="Isolation Forest cost per inference")
-    p.add_argument("--ae-cost", type=float, default=2.5, help="Autoencoder cost per inference")
+    p.add_argument("--ocsvm-model-path", default=None, help="Path to OCSVM model")
+    p.add_argument("--lstm-ae-model-path", default=None, help="Path to LSTM-AE model")
+    p.add_argument("--wgan-model-path", default=None, help="Path to WGAN-GP model")
+    p.add_argument("--ocsvm-cost", type=float, default=1.0, help="OCSVM cost per inference")
+    p.add_argument("--lstm-ae-cost", type=float, default=2.5, help="LSTM-AE cost per inference")
+    p.add_argument("--wgan-cost", type=float, default=8.0, help="WGAN-GP cost per inference")
     return p.parse_args()
 
 
@@ -37,19 +35,25 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if_model_path = args.if_model_path
+    if_model_path = args.ocsvm_model_path
     if if_model_path is None:
-        if_model_path = os.path.join(REPO_ROOT, "agents", "isolation_forest", "models", "isolation_forest.pkl")
+        if_model_path = os.path.join(REPO_ROOT, "agents", "ocsvm", "models", "ocsvm.pkl")
 
-    ae_model_path = args.ae_model_path
+    ae_model_path = args.lstm_ae_model_path
     if ae_model_path is None:
-        ae_model_path = os.path.join(REPO_ROOT, "agents", "autoencoder", "models", "autoencoder.pt")
+        ae_model_path = os.path.join(REPO_ROOT, "agents", "lstm_autoencoder", "models", "lstm_autoencoder.pt")
 
-    from agents.autoencoder.service import Autoencoder
-    from agents.isolation_forest.service import IsolationForestAgent
+    llm_model_path = args.wgan_model_path
+    if llm_model_path is None:
+        llm_model_path = os.path.join(REPO_ROOT, "agents", "wgan_gp", "models", "wgan_gp.pt")
 
-    if_agent = IsolationForestAgent(model_path=if_model_path, cost=args.if_cost)
-    ae_agent = Autoencoder(model_path=ae_model_path, cost=args.ae_cost)
+    from agents.lstm_autoencoder.service import LSTMAutoencoderAgent
+    from agents.ocsvm.service import OCSVMAgent
+    from agents.wgan_gp.service import WGANGPAgent
+
+    if_agent = OCSVMAgent(model_path=if_model_path, cost=args.ocsvm_cost)
+    ae_agent = LSTMAutoencoderAgent(model_path=ae_model_path, cost=args.lstm_ae_cost)
+    llm_agent = WGANGPAgent(model_path=llm_model_path, cost=args.wgan_cost)
 
     rows = load_replay_dataset(args.dataset, max_rows=(args.max_flows or None))
     if not rows:
@@ -60,31 +64,28 @@ def main() -> None:
     probabilities: list[float] = []
     costs: list[float] = []
 
-    ensemble_cost = args.if_cost + args.ae_cost
+    ensemble_cost = args.ocsvm_cost + args.lstm_ae_cost + args.wgan_cost
 
-    for idx, row in enumerate(rows):
+    for row in rows:
         true_label = row.get("true_label")
         if true_label is None:
             continue
 
         if_output = if_agent.predict_with_uncertainty(row["flow_features"])
-        ae_output = ae_agent.predict_with_uncertainty(row["flow_features"])
+        ae_output = ae_agent.predict_with_uncertainty(row["flow_features"], flow_id=row.get("flow_id"))
+        llm_output = llm_agent.predict_with_uncertainty(row["flow_features"])
 
         p_if = float(if_output["proba"][1])
         p_ae = float(ae_output["proba"][1])
+        p_llm = float(llm_output["proba"][1])
 
-        p_ensemble = (p_if + p_ae) / 2.0
+        p_ensemble = (p_if + p_ae + p_llm) / 3.0
         pred = 1 if p_ensemble >= 0.5 else 0
 
         labels.append(int(true_label))
         probabilities.append(p_ensemble)
         predictions.append(pred)
         costs.append(ensemble_cost)
-
-        logger.info(
-            "[%d] flow_id=%s true=%d pred=%d p_if=%.4f p_ae=%.4f p_ens=%.4f cost=%.2f",
-            idx + 1, row["flow_id"], int(true_label), pred, p_if, p_ae, p_ensemble, ensemble_cost
-        )
 
     if not labels:
         raise RuntimeError("No labeled rows found in dataset")

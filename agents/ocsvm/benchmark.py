@@ -16,16 +16,16 @@ from benchmark.metrics import compute_metrics
 from orchestrator.data.replay import load_replay_dataset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("ae_benchmark")
+logger = logging.getLogger("if_benchmark")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Benchmark Autoencoder agent")
+    p = argparse.ArgumentParser(description="Benchmark One-Class SVM agent")
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv", help="CSV or parquet dataset")
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
     p.add_argument("--model-path", default=None, help="Path to model file")
-    p.add_argument("--cost", type=float, default=2.5, help="Cost per inference")
+    p.add_argument("--cost", type=float, default=1.0, help="Cost per inference")
     return p.parse_args()
 
 
@@ -37,11 +37,11 @@ def main() -> None:
 
     model_path = args.model_path
     if model_path is None:
-        model_path = os.path.join(os.path.dirname(__file__), "models", "autoencoder.pt")
+        model_path = os.path.join(os.path.dirname(__file__), "models", "ocsvm.pkl")
 
-    from agents.autoencoder.service import Autoencoder
+    from agents.ocsvm.service import OCSVMAgent
 
-    agent = Autoencoder(model_path=model_path, cost=args.cost)
+    agent = OCSVMAgent(model_path=model_path, cost=args.cost)
 
     rows = load_replay_dataset(args.dataset, max_rows=(args.max_flows or None))
     if not rows:
@@ -79,10 +79,10 @@ def main() -> None:
         labels=labels,
         probabilities=probabilities,
         costs=costs,
-        approach="autoencoder",
+        approach="ocsvm",
     )
 
-    benchmark_path = output_dir / "benchmark_autoencoder.json"
+    benchmark_path = output_dir / "benchmark_ocsvm.json"
     benchmark_path.write_text(json.dumps(metrics, indent=2))
 
     print(f"Processed {metrics['flows_processed']} flows")

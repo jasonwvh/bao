@@ -18,6 +18,7 @@ from orchestrator.control.scheduler import filter_by_capability, select_enabled_
 from orchestrator.data_plane.a2a_client import A2AClient, A2AClientError
 from orchestrator.data_plane.state_sqlite import SQLiteStateBackend
 from orchestrator.observation_calibrator import ObservationModelCalibrator
+from orchestrator.preprocessing import OrchestratorPreprocessor
 from orchestrator.types import DecisionThresholds, FullBAOState
 from orchestrator.voi_router import VOIRouter
 
@@ -44,6 +45,13 @@ class IntegratedBAOSystem:
             backend=self.state_backend,
         )
         self.calibrator = ObservationModelCalibrator()
+        schema_path = self.config.get("preprocessing", {}).get("schema_path")
+        if schema_path:
+            p = Path(schema_path)
+            if not p.is_absolute():
+                p = (self.config_path.parent / p).resolve()
+            schema_path = str(p)
+        self.preprocessor = OrchestratorPreprocessor(schema_path=schema_path)
 
         registry_path = self._resolve_registry_path()
         registry = load_registry(registry_path)
@@ -75,6 +83,9 @@ class IntegratedBAOSystem:
             c_h=float(costs.get("c_h", 500.0)),
             use_surrogate=bool(self.config.get("voi", {}).get("use_surrogate", True)),
             allow_exact=bool(self.config.get("voi", {}).get("allow_exact", False)),
+            lazy_exact_interval=int(self.config.get("voi", {}).get("lazy_exact_interval", 100)),
+            exact_uncertainty_trigger=float(self.config.get("voi", {}).get("exact_uncertainty_trigger", 0.85)),
+            cache_bins=int(self.config.get("voi", {}).get("cache_bins", 64)),
         )
 
         self.metrics = {
@@ -626,9 +637,10 @@ class IntegratedBAOSystem:
         timestamp: float,
         true_label: Optional[int] = None,
     ) -> Dict[str, Any]:
+        prepared_features = self.preprocessor.transform(flow_features)
         init_state: FullBAOState = {
             "flow_id": flow_id,
-            "flow_features": flow_features,
+            "flow_features": prepared_features,
             "timestamp": timestamp,
             "true_label": true_label,
         }
