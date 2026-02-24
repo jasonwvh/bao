@@ -20,6 +20,9 @@ class UNSWPreprocessor:
     log1p_cols: List[str]
     medians: Dict[str, float]
     iqrs: Dict[str, float]
+    iqr_floor: float = 1.0
+    clip_min: float = -15.0
+    clip_max: float = 15.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -29,6 +32,9 @@ class UNSWPreprocessor:
             "log1p_cols": self.log1p_cols,
             "medians": self.medians,
             "iqrs": self.iqrs,
+            "iqr_floor": self.iqr_floor,
+            "clip_min": self.clip_min,
+            "clip_max": self.clip_max,
         }
 
     @classmethod
@@ -40,6 +46,9 @@ class UNSWPreprocessor:
             log1p_cols=list(payload.get("log1p_cols", [])),
             medians={k: float(v) for k, v in payload.get("medians", {}).items()},
             iqrs={k: float(v) for k, v in payload.get("iqrs", {}).items()},
+            iqr_floor=float(payload.get("iqr_floor", 1.0)),
+            clip_min=float(payload.get("clip_min", -15.0)),
+            clip_max=float(payload.get("clip_max", 15.0)),
         )
 
 
@@ -53,7 +62,13 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     return df
 
 
-def fit_preprocessor(df: pd.DataFrame, categorical_cols: Optional[List[str]] = None) -> UNSWPreprocessor:
+def fit_preprocessor(
+    df: pd.DataFrame,
+    categorical_cols: Optional[List[str]] = None,
+    iqr_floor: float = 1.0,
+    clip_min: float = -15.0,
+    clip_max: float = 15.0,
+) -> UNSWPreprocessor:
     c_cols = categorical_cols or [c for c in DEFAULT_CATEGORICAL if c in df.columns]
 
     numeric_cols: List[str] = []
@@ -85,7 +100,7 @@ def fit_preprocessor(df: pd.DataFrame, categorical_cols: Optional[List[str]] = N
             log1p_cols.append(col)
             s = np.log1p(s)
         q1, q3 = np.percentile(s, [25, 75])
-        iqr = float(max(q3 - q1, 1e-6))
+        iqr = float(max(q3 - q1, float(iqr_floor)))
         medians[col] = float(np.median(s))
         iqrs[col] = iqr
 
@@ -96,6 +111,9 @@ def fit_preprocessor(df: pd.DataFrame, categorical_cols: Optional[List[str]] = N
         log1p_cols=log1p_cols,
         medians=medians,
         iqrs=iqrs,
+        iqr_floor=float(iqr_floor),
+        clip_min=float(clip_min),
+        clip_max=float(clip_max),
     )
 
 
@@ -115,6 +133,7 @@ def transform_row(pre: UNSWPreprocessor, row: Dict[str, Any]) -> tuple[np.ndarra
         if col in pre.log1p_cols and x >= 0.0:
             x = float(np.log1p(x))
         x = (x - pre.medians.get(col, 0.0)) / max(pre.iqrs.get(col, 1.0), 1e-6)
+        x = float(np.clip(x, pre.clip_min, pre.clip_max))
         n[i] = x
 
     for i, col in enumerate(pre.categorical_cols):

@@ -63,13 +63,19 @@ def _row_to_flow(row: Dict[str, Any], idx: int) -> Dict[str, Any]:
     timestamp = _to_float(row.get("timestamp"))
     label = int(float(row["label"]))
 
-    features: Dict[str, float] = {}
+    features: Dict[str, Any] = {}
     for k, v in row.items():
-        if k in {"flow_id", "label", "timestamp"}:
+        if k in {"flow_id", "label", "timestamp", "id", "attack_cat"}:
             continue
         f = _to_float(v)
         if f is not None:
             features[k] = f
+            continue
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s != "":
+            features[k] = s
 
     return {
         "flow_id": flow_id,

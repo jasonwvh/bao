@@ -1,23 +1,16 @@
 from __future__ import annotations
 
 import argparse
-import os
-import sys
-# When running this script directly, ensure the project root is on sys.path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-import argparse
 import json
-import pickle
 from pathlib import Path
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
 from sklearn.svm import OneClassSVM
 
+from agents.common.calibration import fit_logistic_calibrator, logistic_probability, select_probability_threshold
 from agents.common.preprocessing import fit_preprocessor, load_csv, transform_frame
+from agents.common.training_config import load_agent_training_config
 
 
 def _vectorize(num: np.ndarray, cat: np.ndarray, cat_cardinalities: list[int]) -> np.ndarray:
@@ -39,63 +32,104 @@ def _vectorize(num: np.ndarray, cat: np.ndarray, cat_cardinalities: list[int]) -
     return np.concatenate([num, cat_oh], axis=1)
 
 
-def train(dataset: Path, output: Path, seed: int, max_train_normal: int) -> None:
+def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> None:
+    cfg = load_agent_training_config(config_path)
+    shared = dict(cfg.get("shared", {}))
+    pre_cfg = dict(shared.get("preprocessing", {}))
+    cal_cfg = dict(shared.get("calibration", {}))
+    agent_cfg = dict(cfg.get("ocsvm", {}))
+
+    val_fraction = float(shared.get("validation_fraction", 0.2))
+    val_fraction = min(0.4, max(0.05, val_fraction))
+
+    probability_clip = list(cal_cfg.get("probability_clip", [0.001, 0.999]))
+    p_lo = float(probability_clip[0])
+    p_hi = float(probability_clip[1])
+
+    max_train_normal = int(agent_cfg.get("max_train_normal", 30000))
+    nu_grid = list(agent_cfg.get("nu_grid", [0.01, 0.03, 0.05, 0.1]))
+    gamma_grid = list(agent_cfg.get("gamma_grid", ["scale", "auto", 0.005, 0.01, 0.03]))
+
     df = load_csv(dataset)
     if "id" in df.columns:
         df = df.sort_values("id").reset_index(drop=True)
 
     y = df["label"].astype(int).to_numpy()
-    pre = fit_preprocessor(df)
-    num, cat = transform_frame(pre, df)
+    train_idx, cal_idx = train_test_split(
+        np.arange(len(df)),
+        test_size=val_fraction,
+        random_state=seed,
+        shuffle=True,
+        stratify=y,
+    )
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    cal_df = df.iloc[cal_idx].reset_index(drop=True)
+    y_cal = cal_df["label"].astype(int).to_numpy()
+
+    pre = fit_preprocessor(
+        train_df,
+        categorical_cols=list(pre_cfg.get("categorical_cols", ["proto", "service", "state"])),
+        iqr_floor=float(pre_cfg.get("iqr_floor", 1.0)),
+        clip_min=float(pre_cfg.get("clip_min", -15.0)),
+        clip_max=float(pre_cfg.get("clip_max", 15.0)),
+    )
+
+    train_num, train_cat = transform_frame(pre, train_df)
+    cal_num, cal_cat = transform_frame(pre, cal_df)
     cat_cardinalities = [len(pre.vocabularies[c]) for c in pre.categorical_cols]
-    x_all = _vectorize(num, cat, cat_cardinalities)
 
-    x_train = x_all[y == 0]
-    if len(x_train) == 0:
+    x_train = _vectorize(train_num, train_cat, cat_cardinalities)
+    x_cal = _vectorize(cal_num, cal_cat, cat_cardinalities)
+
+    y_train = train_df["label"].astype(int).to_numpy()
+    x_train_normal = x_train[y_train == 0]
+    if len(x_train_normal) == 0:
         raise RuntimeError("No benign rows to train One-Class SVM")
-    if len(x_train) > max_train_normal:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(x_train), size=max_train_normal, replace=False)
-        x_train = x_train[idx]
 
-    grid_nu = [0.01, 0.03, 0.05, 0.1]
-    grid_gamma = ["scale", "auto", 0.01, 0.05]
+    if len(x_train_normal) > max_train_normal:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(x_train_normal), size=max_train_normal, replace=False)
+        x_train_normal = x_train_normal[idx]
 
     best_model = None
-    best_f1 = -1.0
+    best_calibrator = None
+    best_threshold = 0.5
+    best_ba = -1.0
     best_scores = None
     best_cfg = None
 
-    for nu in grid_nu:
-        for gamma in grid_gamma:
-            model = OneClassSVM(kernel="rbf", nu=nu, gamma=gamma)
-            model.fit(x_train)
-            scores = -model.decision_function(x_all)
-
-            thr = float(np.percentile(scores[y == 0], 95.0)) if np.any(y == 0) else float(np.percentile(scores, 95.0))
-            preds = (scores >= thr).astype(int)
-            f1 = float(f1_score(y, preds, zero_division=0))
-
-            if f1 > best_f1:
-                best_f1 = f1
+    for nu in nu_grid:
+        for gamma in gamma_grid:
+            model = OneClassSVM(kernel="rbf", nu=float(nu), gamma=gamma)
+            model.fit(x_train_normal)
+            scores_cal = -model.decision_function(x_cal)
+            calibrator = fit_logistic_calibrator(scores_cal, y_cal, seed=seed)
+            probs_cal = logistic_probability(scores_cal, calibrator, clip_lo=p_lo, clip_hi=p_hi)
+            thr, ba = select_probability_threshold(np.asarray(probs_cal), y_cal)
+            if ba > best_ba:
+                best_ba = float(ba)
                 best_model = model
-                best_scores = scores
-                best_cfg = {"nu": nu, "gamma": gamma, "threshold": thr}
+                best_calibrator = calibrator
+                best_threshold = float(thr)
+                best_scores = scores_cal
+                best_cfg = {
+                    "nu": float(nu),
+                    "gamma": gamma,
+                    "balanced_accuracy": float(ba),
+                }
 
     if best_model is None or best_scores is None or best_cfg is None:
         raise RuntimeError("Failed to fit One-Class SVM")
 
-    calibrator = None
-    if len(np.unique(y)) > 1:
-        calibrator = LogisticRegression(max_iter=1000, random_state=seed)
-        calibrator.fit(best_scores.reshape(-1, 1), y)
-
-    benign = best_scores[y == 0] if np.any(y == 0) else best_scores
-    malicious = best_scores[y == 1] if np.any(y == 1) else best_scores
+    benign = best_scores[y_cal == 0] if np.any(y_cal == 0) else best_scores
+    malicious = best_scores[y_cal == 1] if np.any(y_cal == 1) else best_scores
 
     payload = {
         "model": best_model,
-        "calibrator": calibrator,
+        "calibrator": best_calibrator,
+        "threshold_probability": best_threshold,
+        "probability_clip": [p_lo, p_hi],
         "preprocessor": pre.to_dict(),
         "cat_cardinalities": cat_cardinalities,
         "score_stats": {
@@ -111,39 +145,54 @@ def train(dataset: Path, output: Path, seed: int, max_train_normal: int) -> None
         "meta": {
             "dataset": str(dataset),
             "rows": int(len(df)),
-            "features": int(x_all.shape[1]),
+            "train_rows": int(len(train_df)),
+            "calibration_rows": int(len(cal_df)),
+            "features": int(x_train.shape[1]),
             "seed": int(seed),
-            "best_f1": float(best_f1),
+            "validation_fraction": float(val_fraction),
+            "best_balanced_accuracy": float(best_ba),
         },
     }
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, "wb") as f:
+    with output.open("wb") as f:
+        import pickle
+
         pickle.dump(payload, f)
 
-    print(json.dumps({"saved_model": str(output), "rows": int(len(df)), "features": int(x_all.shape[1])}, indent=2))
+    print(
+        json.dumps(
+            {
+                "saved_model": str(output),
+                "rows": int(len(df)),
+                "features": int(x_train.shape[1]),
+                "balanced_accuracy": float(best_ba),
+            },
+            indent=2,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
     default_data = Path(__file__).resolve().parents[1] / "../data" / "UNSW_NB15_training-set.csv"
     default_model = Path(__file__).resolve().parent / "models" / "ocsvm.pkl"
+    default_cfg = Path(__file__).resolve().parents[2] / "config" / "agent_training.yaml"
 
     p = argparse.ArgumentParser(description="Train One-Class SVM on UNSW-NB15")
     p.add_argument("--dataset", default=str(default_data), help="Path to UNSW training CSV")
     p.add_argument("--output", default=str(default_model), help="Output .pkl model path")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-train-normal", type=int, default=12000)
+    p.add_argument("--config", default=str(default_cfg), help="Path to agent training YAML")
     return p.parse_args()
 
 
 def main() -> None:
-    print("Starting One-Class SVM training...")
     args = parse_args()
     train(
         dataset=Path(args.dataset),
         output=Path(args.output),
         seed=int(args.seed),
-        max_train_normal=int(args.max_train_normal),
+        config_path=Path(args.config),
     )
 
 

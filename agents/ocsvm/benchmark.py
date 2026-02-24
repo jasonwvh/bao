@@ -116,7 +116,10 @@ def main() -> None:
 
     metrics = acc.compute(approach="ocsvm")
     replay_path = output_dir / "replay_results.json"
-    replay_path.write_text(json.dumps(replay_rows, indent=2))
+    replay_agent_path = output_dir / "replay_results_ocsvm.json"
+    replay_payload = json.dumps(replay_rows, indent=2)
+    replay_path.write_text(replay_payload)
+    replay_agent_path.write_text(replay_payload)
 
     benchmark_path = output_dir / "benchmark_ocsvm.json"
     write_json(benchmark_path, metrics)
@@ -146,6 +149,7 @@ def main() -> None:
     print(f"Avg cost/flow: {metrics['avg_cost_per_flow']:.4f}")
     print(f"Output: {benchmark_path}")
     print(f"Replay output: {replay_path}")
+    print(f"Replay output (agent): {replay_agent_path}")
 
 
 if __name__ == "__main__":

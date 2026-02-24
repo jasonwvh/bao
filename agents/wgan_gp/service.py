@@ -12,49 +12,34 @@ import numpy as np
 import torch
 from torch import nn
 
+from agents.common.calibration import align_probability_threshold, entropy_from_probability, logistic_probability
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("wgan_gp")
 
 
-class Critic(nn.Module):
-    def __init__(self, num_dim: int, cat_cardinalities: list[int], emb_dims: list[int] | None = None):
+class TabularAutoencoder(nn.Module):
+    def __init__(self, in_dim: int, latent_dim: int = 64, dropout: float = 0.1):
         super().__init__()
-        self.cat_embeddings = nn.ModuleList()
-        self.emb_dims = emb_dims if emb_dims is not None else []
-        if emb_dims is None:
-            self.emb_dims = []
-            for card in cat_cardinalities:
-                emb_dim = int(min(16, max(4, card // 4)))
-                self.cat_embeddings.append(nn.Embedding(int(max(2, card)), emb_dim))
-                self.emb_dims.append(emb_dim)
-        else:
-            for card, emb_dim in zip(cat_cardinalities, emb_dims):
-                self.cat_embeddings.append(nn.Embedding(int(max(2, card)), emb_dim))
-        
-        self.num_dim = num_dim
-        input_dim = num_dim + sum(self.emb_dims)
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.LeakyReLU(0.2),
-            nn.Linear(128, 128),
-            nn.LeakyReLU(0.2),
-            nn.Linear(128, 1),
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, in_dim),
         )
 
-    def embed_categorical(self, x_cat: torch.Tensor) -> torch.Tensor:
-        if len(self.cat_embeddings) == 0:
-            return torch.empty(x_cat.size(0), 0, device=x_cat.device)
-        parts = []
-        for i, emb in enumerate(self.cat_embeddings):
-            parts.append(emb(x_cat[:, i]))
-        return torch.cat(parts, dim=-1)
-
-    def prepare_input(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
-        embedded_cat = self.embed_categorical(x_cat)
-        return torch.cat([x_num, embedded_cat], dim=-1)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.decoder(self.encoder(x))
 
 
 class WGANGPAgent:
@@ -73,6 +58,7 @@ class WGANGPAgent:
             )
 
         payload = torch.load(self.model_path, map_location="cpu", weights_only=False)
+
         self.preprocessor = dict(payload["preprocessor"])
         self.numeric_cols = list(self.preprocessor.get("numeric_cols", []))
         self.categorical_cols = list(self.preprocessor.get("categorical_cols", []))
@@ -80,17 +66,25 @@ class WGANGPAgent:
         self.log1p_cols = set(self.preprocessor.get("log1p_cols", []))
         self.medians = {k: float(v) for k, v in self.preprocessor.get("medians", {}).items()}
         self.iqrs = {k: float(v) for k, v in self.preprocessor.get("iqrs", {}).items()}
+        self.clip_min = float(self.preprocessor.get("clip_min", -15.0))
+        self.clip_max = float(self.preprocessor.get("clip_max", 15.0))
         self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
-        cfg = payload.get("model_config", {})
-        self.invert_score = bool(cfg.get("invert_score", False))
 
-        num_dim = int(cfg.get("num_dim", len(self.numeric_cols)))
-        emb_dims = [int(x) for x in cfg.get("emb_dims", [])]
-        self.critic = Critic(num_dim=num_dim, cat_cardinalities=self.cat_cardinalities, emb_dims=emb_dims)
-        self.critic.load_state_dict(payload["critic"])
-        self.critic.eval()
+        cfg = payload.get("model_config", {})
+
+        self.model = TabularAutoencoder(
+            in_dim=int(cfg.get("in_dim")),
+            latent_dim=int(cfg.get("latent_dim", 64)),
+            dropout=float(cfg.get("dropout", 0.1)),
+        )
+        self.model.load_state_dict(payload["state_dict"])
+        self.model.eval()
 
         self.calibration = payload.get("calibration", {})
+        self.threshold_probability = float(payload.get("threshold_probability", 0.5))
+        self.probability_clip = payload.get("probability_clip", [0.001, 0.999])
+        self.p_lo = float(self.probability_clip[0])
+        self.p_hi = float(self.probability_clip[1])
         self.score_stats = payload.get("score_stats", {})
 
     def _to_float(self, value: Any, default: float = 0.0) -> float:
@@ -112,6 +106,7 @@ class WGANGPAgent:
             if col in self.log1p_cols and x >= 0.0:
                 x = float(np.log1p(x))
             x = (x - self.medians.get(col, 0.0)) / max(self.iqrs.get(col, 1.0), 1e-6)
+            x = float(np.clip(x, self.clip_min, self.clip_max))
             n[i] = x
 
         for i, col in enumerate(self.categorical_cols):
@@ -125,33 +120,45 @@ class WGANGPAgent:
 
         return n, c
 
+    def _vectorize(self, n: np.ndarray, c: np.ndarray) -> np.ndarray:
+        if len(self.cat_cardinalities) == 0:
+            return n.astype(np.float32)
+
+        total_cat_dim = int(sum(self.cat_cardinalities))
+        cat_oh = np.zeros(total_cat_dim, dtype=np.float32)
+        offset = 0
+        for i, card in enumerate(self.cat_cardinalities):
+            idx = int(np.clip(c[i], 0, max(card - 1, 0)))
+            cat_oh[offset + idx] = 1.0
+            offset += card
+
+        return np.concatenate([n.astype(np.float32), cat_oh], axis=0)
+
     def _pdf(self, x: float, mu: float, sigma: float) -> float:
         s = max(float(sigma), 1e-6)
         coeff = 1.0 / (s * math.sqrt(2.0 * math.pi))
         return float(max(1e-9, coeff * math.exp(-((x - mu) ** 2) / (2.0 * s * s))))
 
+    def _score_to_prob(self, score: float) -> float:
+        p_raw = float(
+            logistic_probability(
+                score,
+                self.calibration,
+                clip_lo=self.p_lo,
+                clip_hi=self.p_hi,
+            )
+        )
+        return align_probability_threshold(p_raw, self.threshold_probability)
+
     def predict_with_uncertainty(self, flow_features: Dict[str, Any], seed: Optional[int] = None) -> Dict[str, Any]:
         n, c = self._transform_row(flow_features)
-        x_num = torch.from_numpy(n.reshape(1, -1))
-        x_cat = torch.from_numpy(c.reshape(1, -1))
-        
+        x = torch.from_numpy(self._vectorize(n, c).reshape(1, -1))
         with torch.no_grad():
-            x = self.critic.prepare_input(x_num, x_cat)
-            score = float(-self.critic(x).item())
-        if self.invert_score:
-            score = -score
+            recon = self.model(x)
+            score = float(torch.mean((recon - x) ** 2).item())
 
-        if self.calibration and "coef" in self.calibration and "intercept" in self.calibration:
-            z = float(self.calibration["coef"]) * score + float(self.calibration["intercept"])
-            p = 1.0 / (1.0 + math.exp(-z))
-        else:
-            mean = float(self.score_stats.get("mean", 0.0))
-            std = float(self.score_stats.get("std", 1.0))
-            z = (score - mean) / max(std, 1e-9)
-            p = 1.0 / (1.0 + math.exp(-z))
-
-        p = float(max(0.001, min(0.999, p)))
-        entropy = -(p * math.log(max(p, 1e-9)) + (1.0 - p) * math.log(max(1.0 - p, 1e-9)))
+        p = self._score_to_prob(score)
+        entropy = entropy_from_probability(p)
         epistemic = float(max(0.0, 1.0 - min(abs(2.0 * p - 1.0), 1.0)))
 
         p_obs_given_attack = self._pdf(
@@ -167,7 +174,10 @@ class WGANGPAgent:
 
         return {
             "proba": [1.0 - p, p],
-            "prediction": {"label": "malicious" if p >= 0.5 else "benign", "probability": p},
+            "prediction": {
+                "label": "malicious" if p >= 0.5 else "benign",
+                "probability": p,
+            },
             "uncertainty": {
                 "epistemic": epistemic,
                 "aleatoric": float(entropy),
@@ -180,9 +190,11 @@ class WGANGPAgent:
             "cost": self.cost,
             "agent_id": self.agent_id,
             "metadata": {
-                "model": "wgan_gp_anomaly",
+                "model": "wgan_gp_tabular_autoencoder",
                 "model_path": str(self.model_path),
                 "anomaly_score": score,
+                "threshold_probability": self.threshold_probability,
+                "threshold_aligned": 0.5,
             },
         }
 

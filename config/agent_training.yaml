@@ -1,0 +1,33 @@
+shared:
+  seed: 42
+  validation_fraction: 0.2
+  preprocessing:
+    categorical_cols: [proto, service, state]
+    iqr_floor: 1.0
+    clip_min: -15.0
+    clip_max: 15.0
+  calibration:
+    method: logistic
+    probability_clip: [0.001, 0.999]
+
+ocsvm:
+  max_train_normal: 12000
+  nu_grid: [0.01, 0.03, 0.05]
+  gamma_grid: [scale, 0.01, 0.03]
+
+lstm_autoencoder:
+  hidden_dim: 64
+  epochs: 20
+  batch_size: 256
+  learning_rate: 0.001
+  window_size: 8
+  stride: 1
+  dropout: 0.15
+
+wgan_gp:
+  epochs: 15
+  batch_size: 256
+  learning_rate: 0.0002
+  z_dim: 32
+  n_critic: 5
+  lambda_gp: 10.0

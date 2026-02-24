@@ -2,7 +2,7 @@ orchestration:
   seed: 7
   agent_registry_path: agents.yaml
   update_mode: posterior_first
-  agent_sequence: [ocsvm, lstm_autoencoder, wgan_gp]
+  agent_sequence: [lstm_autoencoder, wgan_gp, ocsvm]
 
 belief:
   prior_attack_rate: 0.5
@@ -11,7 +11,10 @@ belief:
 
 fusion:
   method: logit_pool
-  agent_weights: {}
+  agent_weights:
+    lstm_autoencoder: 1.0
+    wgan_gp: 0.5
+    ocsvm: 0.25
 
 decision:
   policy: expected_cost_min
@@ -22,9 +25,7 @@ decision:
 
 query:
   uncertainty_threshold: 0.646
-  uncertainty_threshold_stage1: 0.646
-  uncertainty_threshold_stage2: 0.606
-  max_agents: 3
+  max_agents: 1
 
 voi:
   enabled: false
@@ -32,7 +33,7 @@ voi:
 
 benchmark:
   reset_state: true
-  prediction_source: decision
+  prediction_source: probability
   write_manifest: true
 
 preprocessing:

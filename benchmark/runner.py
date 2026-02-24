@@ -86,6 +86,13 @@ def infer_prediction(
             return 0
         return 1 if p >= 0.5 else 0
 
+    if label_hint is not None:
+        hint = str(label_hint).strip().lower()
+        if hint in {"malicious", "attack", "reject"}:
+            return 1
+        if hint in {"benign", "clean", "accept"}:
+            return 0
+
     return 1 if p >= 0.5 else 0
 
 

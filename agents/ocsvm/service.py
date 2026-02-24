@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from agents.common.calibration import align_probability_threshold, entropy_from_probability, logistic_probability
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("ocsvm")
 
@@ -26,11 +28,16 @@ class OCSVMAgent:
                 f"Model not found: {self.model_path}. Train with: python3 -m agents.ocsvm.train"
             )
 
-        with open(self.model_path, "rb") as f:
+        with self.model_path.open("rb") as f:
             payload = pickle.load(f)
 
         self.model = payload["model"]
-        self.calibrator = payload.get("calibrator")
+        self.calibrator = payload.get("calibrator") or {"coef": 1.0, "intercept": 0.0}
+        self.threshold_probability = float(payload.get("threshold_probability", 0.5))
+        self.probability_clip = payload.get("probability_clip", [0.001, 0.999])
+        self.p_lo = float(self.probability_clip[0])
+        self.p_hi = float(self.probability_clip[1])
+
         self.preprocessor = dict(payload["preprocessor"])
         self.numeric_cols = list(self.preprocessor.get("numeric_cols", []))
         self.categorical_cols = list(self.preprocessor.get("categorical_cols", []))
@@ -38,6 +45,9 @@ class OCSVMAgent:
         self.log1p_cols = set(self.preprocessor.get("log1p_cols", []))
         self.medians = {k: float(v) for k, v in self.preprocessor.get("medians", {}).items()}
         self.iqrs = {k: float(v) for k, v in self.preprocessor.get("iqrs", {}).items()}
+        self.clip_min = float(self.preprocessor.get("clip_min", -15.0))
+        self.clip_max = float(self.preprocessor.get("clip_max", 15.0))
+
         self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
         self.score_stats = payload.get("score_stats", {})
 
@@ -60,6 +70,7 @@ class OCSVMAgent:
             if col in self.log1p_cols and x >= 0.0:
                 x = float(np.log1p(x))
             x = (x - self.medians.get(col, 0.0)) / max(self.iqrs.get(col, 1.0), 1e-6)
+            x = float(np.clip(x, self.clip_min, self.clip_max))
             n[i] = x
 
         for i, col in enumerate(self.categorical_cols):
@@ -97,16 +108,17 @@ class OCSVMAgent:
         x = self._vectorize(flow_features).reshape(1, -1)
         anomaly_score = float(-self.model.decision_function(x)[0])
 
-        if self.calibrator is not None:
-            p = float(self.calibrator.predict_proba([[anomaly_score]])[0, 1])
-        else:
-            mean = float(self.score_stats.get("mean", 0.0))
-            std = float(self.score_stats.get("std", 1.0))
-            z = (anomaly_score - mean) / max(std, 1e-9)
-            p = 1.0 / (1.0 + math.exp(-z))
+        p_raw = float(
+            logistic_probability(
+                anomaly_score,
+                self.calibrator,
+                clip_lo=self.p_lo,
+                clip_hi=self.p_hi,
+            )
+        )
+        p = align_probability_threshold(p_raw, self.threshold_probability)
 
-        p = float(max(0.001, min(0.999, p)))
-        entropy = -(p * math.log(max(p, 1e-9)) + (1 - p) * math.log(max(1 - p, 1e-9)))
+        entropy = entropy_from_probability(p)
         epistemic = float(max(0.0, 1.0 - min(abs(2.0 * p - 1.0), 1.0)))
 
         p_obs_given_attack = self._pdf(
@@ -139,6 +151,8 @@ class OCSVMAgent:
                 "model": "ocsvm",
                 "model_path": str(self.model_path),
                 "anomaly_score": anomaly_score,
+                "threshold_probability": self.threshold_probability,
+                "threshold_aligned": 0.5,
             },
         }
 

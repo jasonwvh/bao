@@ -100,6 +100,12 @@ python3 main.py \
   --agent-sequence lstm_autoencoder,ocsvm \
   --prediction-source decision \
   --output-dir artifacts/replay
+
+# Full matrix (all agents + BAO)
+python3 benchmark/run_matrix.py \
+  --dataset data/UNSW_NB15_testing-set.csv \
+  --config config/orchestrator_config.yaml \
+  --output-root artifacts/replay/matrix
 ```
 
 ### 6) Stop agents
@@ -154,9 +160,11 @@ make down
 
 - `config/agents.yaml`: registry for containerized agents
 - `config/orchestrator_config.yaml`: source of truth for update mode, fusion, decision costs, query policy, VOI, and benchmark behavior
-- Query gating supports stage-specific uncertainty thresholds:
-  - `query.uncertainty_threshold_stage1` (agent1 -> agent2)
-  - `query.uncertainty_threshold_stage2` (agent2 -> agent3+)
+- `config/agent_training.yaml`: source of truth for shared preprocessing and agent training/calibration hyperparameters
+- Query gating is fully dynamic for arbitrary agent counts:
+  - `query.uncertainty_threshold`
+  - `query.max_agents`
+  - `voi.enabled` and `voi.rho`
 
 ## Project layout
 

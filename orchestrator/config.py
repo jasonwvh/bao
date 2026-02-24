@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -10,6 +11,7 @@ import yaml
 UPDATE_MODES = {"posterior_first", "likelihood_strict"}
 FUSION_METHODS = {"logit_pool"}
 PREDICTION_SOURCES = {"decision", "probability"}
+logger = logging.getLogger("orchestrator.config")
 
 
 @dataclass(frozen=True)
@@ -44,8 +46,6 @@ class DecisionConfig:
 @dataclass(frozen=True)
 class QueryConfig:
     uncertainty_threshold: float
-    uncertainty_threshold_stage1: float
-    uncertainty_threshold_stage2: float
     max_agents: int
 
 
@@ -199,16 +199,12 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
     # Entropy for Bernoulli lives in [0, ln 2]
     uncertainty_threshold = max(0.0, min(0.69314718056, uncertainty_threshold))
-    uncertainty_threshold_stage1 = _to_float(
-        query_raw.get("uncertainty_threshold_stage1", uncertainty_threshold),
-        uncertainty_threshold,
-    )
-    uncertainty_threshold_stage1 = max(0.0, min(0.69314718056, uncertainty_threshold_stage1))
-    uncertainty_threshold_stage2 = _to_float(
-        query_raw.get("uncertainty_threshold_stage2", uncertainty_threshold_stage1),
-        uncertainty_threshold_stage1,
-    )
-    uncertainty_threshold_stage2 = max(0.0, min(0.69314718056, uncertainty_threshold_stage2))
+    # Backward compatibility: stage-specific thresholds are deprecated.
+    if "uncertainty_threshold_stage1" in query_raw or "uncertainty_threshold_stage2" in query_raw:
+        logger.warning(
+            "query.uncertainty_threshold_stage1/stage2 are deprecated and ignored; "
+            "use query.uncertainty_threshold only"
+        )
 
     max_agents = _to_int(query_raw.get("max_agents", orch_raw.get("max_iterations", 1)), 1)
     max_agents = max(1, max_agents)
@@ -250,8 +246,6 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         ),
         query=QueryConfig(
             uncertainty_threshold=uncertainty_threshold,
-            uncertainty_threshold_stage1=uncertainty_threshold_stage1,
-            uncertainty_threshold_stage2=uncertainty_threshold_stage2,
             max_agents=max_agents,
         ),
         voi=VOIConfig(

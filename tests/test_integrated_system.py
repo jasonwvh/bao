@@ -35,37 +35,33 @@ class _FakeA2A:
 
 class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
     def _write_files(self, tmp: Path, sequence: List[str], max_agents: int) -> Path:
+        ids = list(dict.fromkeys(sequence or ["agent_a", "agent_b"]))
+        if len(ids) < 2:
+            ids = ids + ["agent_b"]
+
+        agents = []
+        for i, aid in enumerate(ids):
+            agents.append(
+                {
+                    "id": aid,
+                    "enabled": True,
+                    "endpoint": f"http://example-{aid}",
+                    "transport": "http-json",
+                    "timeout_ms": 1000,
+                    "cost": 1.0,
+                    "capabilities": ["flow_tabular"],
+                    "health_path": "/a2a/health",
+                    "infer_path": "/a2a/infer",
+                    "capabilities_path": "/a2a/capabilities",
+                }
+            )
+
         registry_path = tmp / "agents.yaml"
         registry = {
             "version": "v1",
-            "agents": [
-                {
-                    "id": "agent_a",
-                    "enabled": True,
-                    "endpoint": "http://example-a",
-                    "transport": "http-json",
-                    "timeout_ms": 1000,
-                    "cost": 1.0,
-                    "capabilities": ["flow_tabular"],
-                    "health_path": "/a2a/health",
-                    "infer_path": "/a2a/infer",
-                    "capabilities_path": "/a2a/capabilities",
-                },
-                {
-                    "id": "agent_b",
-                    "enabled": True,
-                    "endpoint": "http://example-b",
-                    "transport": "http-json",
-                    "timeout_ms": 1000,
-                    "cost": 1.0,
-                    "capabilities": ["flow_tabular"],
-                    "health_path": "/a2a/health",
-                    "infer_path": "/a2a/infer",
-                    "capabilities_path": "/a2a/capabilities",
-                },
-            ],
+            "agents": agents,
             "routing": {
-                "default_agents": ["agent_a", "agent_b"],
+                "default_agents": ids,
                 "require_healthy": False,
                 "fallback_strategy": "skip_unhealthy",
             },
@@ -87,7 +83,7 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
             "fusion": {"method": "logit_pool", "agent_weights": {}},
             "decision": {"policy": "expected_cost_min", "costs": {"c_fn": 500.0, "c_fp": 5.0, "c_h": 5000.0}},
             "query": {"uncertainty_threshold": 0.6, "max_agents": max_agents},
-            "voi": {"enabled": True, "rho": 0.7},
+            "voi": {"enabled": False, "rho": 0.7},
             "benchmark": {"reset_state": True, "prediction_source": "probability", "write_manifest": False},
             "a2a": {"retries": 0},
             "state": {"sqlite_path": str(tmp / "state.sqlite")},
@@ -130,6 +126,31 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(fake.calls, ["agent_a"])
             self.assertEqual(res["agents_queried"], ["agent_a"])
+
+    async def test_dynamic_n_agent_sequence_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sequence = ["agent_a", "agent_b", "agent_c", "agent_d"]
+            cfg_path = self._write_files(Path(td), sequence=sequence, max_agents=4)
+            system = IntegratedBAOSystem(cfg_path)
+            fake = _FakeA2A(
+                {
+                    "agent_a": [0.5],
+                    "agent_b": [0.51],
+                    "agent_c": [0.49],
+                    "agent_d": [0.8],
+                }
+            )
+            system.a2a = fake
+
+            res = await system.process_flow(
+                flow_features={"packet_count": 10.0},
+                flow_id="flow-4",
+                timestamp=time.time(),
+                true_label=1,
+            )
+
+            self.assertEqual(fake.calls, sequence)
+            self.assertEqual(res["agents_queried"], sequence)
 
     async def test_single_agent_parity_in_posterior_first_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:

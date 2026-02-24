@@ -4,46 +4,42 @@ import json
 import logging
 import math
 import os
-from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
 from torch import nn
 
+from agents.common.calibration import align_probability_threshold, entropy_from_probability, logistic_probability
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("lstm_autoencoder")
 
 
-class HybridLSTMAutoencoder(nn.Module):
-    def __init__(self, num_dim: int, cat_cardinalities: list[int], hidden_dim: int = 64):
+class TabularAutoencoder(nn.Module):
+    def __init__(self, in_dim: int, latent_dim: int = 64, dropout: float = 0.1):
         super().__init__()
-        self.cat_embeddings = nn.ModuleList()
-        for card in cat_cardinalities:
-            emb_dim = int(min(16, max(4, card // 4)))
-            self.cat_embeddings.append(nn.Embedding(int(max(2, card)), emb_dim))
-        input_dim = num_dim + sum(int(e.embedding_dim) for e in self.cat_embeddings)
-        self.num_dim = num_dim
-        self.encoder = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, batch_first=True)
-        self.decoder = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, batch_first=True)
-        self.out = nn.Linear(hidden_dim, num_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, in_dim),
+        )
 
-    def _embed(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
-        parts = [x_num]
-        for i, emb in enumerate(self.cat_embeddings):
-            parts.append(emb(x_cat[:, :, i]))
-        return torch.cat(parts, dim=-1)
-
-    def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        embedded = self._embed(x_num, x_cat)
-        _, (h_n, _) = self.encoder(embedded)
-        seq_len = embedded.shape[1]
-        dec_in = h_n[-1].unsqueeze(1).repeat(1, seq_len, 1)
-        dec_out, _ = self.decoder(dec_in)
-        recon = self.out(dec_out)
-        return recon, x_num
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self.encoder(x))
 
 
 class LSTMAutoencoderAgent:
@@ -65,24 +61,26 @@ class LSTMAutoencoderAgent:
         self.log1p_cols = set(self.preprocessor.get("log1p_cols", []))
         self.medians = {k: float(v) for k, v in self.preprocessor.get("medians", {}).items()}
         self.iqrs = {k: float(v) for k, v in self.preprocessor.get("iqrs", {}).items()}
-        cfg = payload["model_config"]
-        self.window_size = int(cfg.get("window_size", 8))
+        self.clip_min = float(self.preprocessor.get("clip_min", -15.0))
+        self.clip_max = float(self.preprocessor.get("clip_max", 15.0))
 
-        self.model = HybridLSTMAutoencoder(
-            num_dim=int(cfg["num_dim"]),
-            cat_cardinalities=[int(x) for x in cfg["cat_cardinalities"]],
-            hidden_dim=int(cfg.get("hidden_dim", 64)),
+        self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
+        cfg = payload.get("model_config", {})
+
+        self.model = TabularAutoencoder(
+            in_dim=int(cfg.get("in_dim")),
+            latent_dim=int(cfg.get("latent_dim", 64)),
+            dropout=float(cfg.get("dropout", 0.1)),
         )
         self.model.load_state_dict(payload["state_dict"])
         self.model.eval()
 
         self.loss_stats = payload.get("loss_stats", {})
-        self.invert_score = bool(self.loss_stats.get("invert_score", False))
-        self.score_mapping = payload.get("score_mapping", {})
         self.calibration = payload.get("calibration", {})
-        self.histories: Dict[str, Deque[Tuple[np.ndarray, np.ndarray]]] = defaultdict(
-            lambda: deque(maxlen=self.window_size)
-        )
+        self.threshold_probability = float(payload.get("threshold_probability", 0.5))
+        self.probability_clip = payload.get("probability_clip", [0.001, 0.999])
+        self.p_lo = float(self.probability_clip[0])
+        self.p_hi = float(self.probability_clip[1])
 
     def _to_float(self, value: Any, default: float = 0.0) -> float:
         try:
@@ -103,6 +101,7 @@ class LSTMAutoencoderAgent:
             if col in self.log1p_cols and x >= 0.0:
                 x = float(np.log1p(x))
             x = (x - self.medians.get(col, 0.0)) / max(self.iqrs.get(col, 1.0), 1e-6)
+            x = float(np.clip(x, self.clip_min, self.clip_max))
             n[i] = x
 
         for i, col in enumerate(self.categorical_cols):
@@ -116,68 +115,61 @@ class LSTMAutoencoderAgent:
 
         return n, c
 
+    def _vectorize(self, n: np.ndarray, c: np.ndarray) -> np.ndarray:
+        if len(self.cat_cardinalities) == 0:
+            return n.astype(np.float32)
+
+        total_cat_dim = int(sum(self.cat_cardinalities))
+        cat_oh = np.zeros(total_cat_dim, dtype=np.float32)
+        offset = 0
+        for i, card in enumerate(self.cat_cardinalities):
+            idx = int(np.clip(c[i], 0, max(card - 1, 0)))
+            cat_oh[offset + idx] = 1.0
+            offset += card
+
+        return np.concatenate([n.astype(np.float32), cat_oh], axis=0)
+
     def _pdf(self, x: float, mu: float, sigma: float) -> float:
         s = max(float(sigma), 1e-6)
         coeff = 1.0 / (s * math.sqrt(2.0 * math.pi))
         return float(max(1e-9, coeff * math.exp(-((x - mu) ** 2) / (2.0 * s * s))))
 
-    def _score_to_prob(self, mse: float) -> float:
-        score = -float(mse) if self.invert_score else float(mse)
-        use_calibration = (
-            self.calibration
-            and "coef" in self.calibration
-            and "intercept" in self.calibration
-            and abs(float(self.calibration.get("coef", 0.0))) > 1e-6
+    def _score_to_prob(self, score: float) -> float:
+        p_raw = float(
+            logistic_probability(
+                score,
+                self.calibration,
+                clip_lo=self.p_lo,
+                clip_hi=self.p_hi,
+            )
         )
-        if use_calibration:
-            z = float(self.calibration["coef"]) * score + float(self.calibration["intercept"])
-        else:
-            threshold = float(self.score_mapping.get("threshold", 0.0))
-            scale = float(self.score_mapping.get("scale", 1.0))
-            z = (score - threshold) / max(scale * 0.5, 1e-9)
-        p = 1.0 / (1.0 + math.exp(-z))
-        return float(min(0.999, max(0.001, p)))
-
-    def _build_sequence(self, flow_features: Dict[str, Any], flow_id: Optional[str]) -> tuple[np.ndarray, np.ndarray]:
-        n, c = self._transform_row(flow_features)
-        fid = str(flow_id or "__default__")
-        hist = self.histories[fid]
-        hist.append((n, c))
-
-        items = list(hist)
-        if len(items) < self.window_size:
-            pad = [items[0]] * (self.window_size - len(items))
-            items = pad + items
-
-        seq_num = np.stack([x[0] for x in items[-self.window_size :]], axis=0)
-        seq_cat = np.stack([x[1] for x in items[-self.window_size :]], axis=0)
-        return seq_num, seq_cat
+        return align_probability_threshold(p_raw, self.threshold_probability)
 
     def predict_with_uncertainty(
         self,
         flow_features: Dict[str, Any],
         seed: Optional[int] = None,
         flow_id: Optional[str] = None,
+        stream_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        seq_num, seq_cat = self._build_sequence(flow_features, flow_id=flow_id)
-        x_num_t = torch.from_numpy(seq_num).unsqueeze(0)
-        x_cat_t = torch.from_numpy(seq_cat).unsqueeze(0)
+        n, c = self._transform_row(flow_features)
+        x = torch.from_numpy(self._vectorize(n, c).reshape(1, -1))
 
         with torch.no_grad():
-            recon, target = self.model(x_num_t, x_cat_t)
-            mse = float(torch.mean((recon - target) ** 2).item())
+            recon = self.model(x)
+            score = float(torch.mean((recon - x) ** 2).item())
 
-        p = self._score_to_prob(mse)
-        entropy = -(p * math.log(max(p, 1e-9)) + (1.0 - p) * math.log(max(1.0 - p, 1e-9)))
+        p = self._score_to_prob(score)
+        entropy = entropy_from_probability(p)
         epistemic = float(max(0.0, 1.0 - min(abs(2.0 * p - 1.0), 1.0)))
 
         p_obs_given_attack = self._pdf(
-            mse,
+            score,
             float(self.loss_stats.get("mal_mean", self.loss_stats.get("mean", 0.0))),
             float(self.loss_stats.get("mal_std", self.loss_stats.get("std", 1.0))),
         )
         p_obs_given_clean = self._pdf(
-            mse,
+            score,
             float(self.loss_stats.get("benign_mean", self.loss_stats.get("mean", 0.0))),
             float(self.loss_stats.get("benign_std", self.loss_stats.get("std", 1.0))),
         )
@@ -198,10 +190,12 @@ class LSTMAutoencoderAgent:
             "cost": self.cost,
             "agent_id": self.agent_id,
             "metadata": {
-                "model": "lstm_autoencoder",
+                "model": "lstm_autoencoder_tabular",
                 "model_path": str(self.model_path),
-                "anomaly_score": mse,
-                "window_size": self.window_size,
+                "anomaly_score": score,
+                "threshold_probability": self.threshold_probability,
+                "threshold_aligned": 0.5,
+                "stream_id": stream_id if stream_id else "__global_stream__",
             },
         }
 
@@ -235,8 +229,15 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(body.decode("utf-8") or "{}")
 
         feats = payload.get("flow_features", {})
-        seed = payload.get("context", {}).get("seed")
-        out = AGENT.predict_with_uncertainty(feats, seed=seed, flow_id=payload.get("flow_id"))
+        ctx = payload.get("context", {})
+        seed = ctx.get("seed")
+        stream_id = ctx.get("stream_id")
+        out = AGENT.predict_with_uncertainty(
+            feats,
+            seed=seed,
+            flow_id=payload.get("flow_id"),
+            stream_id=stream_id,
+        )
         return self._send(out)
 
     def _send(self, payload):
