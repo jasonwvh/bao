@@ -40,7 +40,7 @@ agents:
       tier: gan
 
 routing:
-  default_agents: [lstm_autoencoder, ocsvm]
+  default_agents: [ocsvm, lstm_autoencoder, wgan_gp]
   require_healthy: true
   max_parallel: 1
   fallback_strategy: skip_unhealthy

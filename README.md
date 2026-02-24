@@ -1,13 +1,15 @@
 # BAO (Bayesian Agent Orchestrator)
 
-Containerized multi-agent orchestrator with a lightweight Bayesian control layer, VOI routing, and a shared state backend. Agents run as independent HTTP services; the orchestrator connects to them via a registry in `config/agents.yaml`.
+Containerized multi-agent orchestrator with a deterministic Bayesian cascade controller, VOI-based query gating, and a shared SQLite state backend. Agents run as independent HTTP services; the orchestrator connects to them via a registry in `config/agents.yaml`.
 
 **Key traits**
 - Control plane vs data plane split
 - Registry-driven agent discovery (YAML)
 - A2A HTTP+JSON contract for inference/health/capabilities
 - Shared state backend (SQLite) keyed by `agent_id`
-- Lightweight Bayesian updates and surrogate VOI in hot path
+- Posterior-first belief updates with optional strict-likelihood mode
+- Expected-cost action selection (`accept` / `reject` / `defer`)
+- Approximate VOI query gating from configuration
 
 **Architecture diagram**
 
@@ -15,8 +17,8 @@ Containerized multi-agent orchestrator with a lightweight Bayesian control layer
 flowchart LR
   subgraph ControlPlane["Control Plane"]
     REG["Agent Registry (YAML)"]
-    ORCH["Orchestrator\nLangGraph Flow\nVOI + Decision"]
-    POL["Routing Policy\nThresholds"]
+    ORCH["Orchestrator\nDeterministic Cascade\nBelief + VOI + Decision"]
+    POL["Config-Driven Policy\nCosts + Query"]
   end
 
   subgraph DataPlane["Data Plane"]
@@ -58,8 +60,17 @@ Requires a labeled dataset with a `label` column.
 ```bash
 python3 main.py \
   --dataset /path/to/replay.csv \
-  --config config/orchestrator_config.json \
+  --config config/orchestrator_config.yaml \
   --max-flows 1000
+```
+
+Useful replay options:
+```bash
+python3 main.py \
+  --dataset data/UNSW_NB15_testing-set.csv \
+  --config config/orchestrator_config.yaml \
+  --prediction-source decision \
+  --reset-state
 ```
 
 ### 4) Check agent health
@@ -67,7 +78,27 @@ python3 main.py \
 make health
 ```
 
-### 5) Stop agents
+### 5) Run benchmarks
+All benchmark scripts use A2A black-box calls through `config/agents.yaml`.
+
+```bash
+# First-agent baseline (LSTM)
+python3 agents/lstm_autoencoder/benchmark.py \
+  --dataset data/UNSW_NB15_testing-set.csv \
+  --prediction-source decision \
+  --output-dir artifacts/replay
+
+# BAO replay
+python3 main.py \
+  --dataset data/UNSW_NB15_testing-set.csv \
+  --config config/orchestrator_config.yaml \
+  --max-agents 1 \
+  --agent-sequence lstm_autoencoder,ocsvm \
+  --prediction-source decision \
+  --output-dir artifacts/replay
+```
+
+### 6) Stop agents
 ```bash
 make down
 ```
@@ -118,7 +149,7 @@ make down
 ## Configuration
 
 - `config/agents.yaml`: registry for containerized agents
-- `config/orchestrator_config.json`: orchestration thresholds/costs/replay/voi flags
+- `config/orchestrator_config.yaml`: source of truth for update mode, fusion, decision costs, query policy, VOI, and benchmark behavior
 
 ## Project layout
 
@@ -126,10 +157,10 @@ make down
 .
 ├── main.py                          # Entry point for replay
 ├── Makefile                         # Build/run commands
-├── docker-compose.agents.yml        # Agent containers
+├── docker-compose.yml               # Agent containers
 ├── config/
 │   ├── agents.yaml                  # Agent registry
-│   └── orchestrator_config.json     # Orchestrator config
+│   └── orchestrator_config.yaml     # Orchestrator config
 ├── orchestrator/
 │   ├── integrated_system.py         # Orchestrator runtime
 │   ├── control/                     # Policy, registry, scheduler
@@ -142,4 +173,5 @@ make down
 
 ## Notes
 - All inference is via A2A HTTP - agents are black boxes
-- Lightweight Bayesian updates are used in the hot path; exact VOI is off by default
+- One-agent parity is guaranteed in `posterior_first` mode when `query.max_agents=1`
+- Benchmark runs can reset state and emit reproducibility manifests

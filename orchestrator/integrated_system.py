@@ -1,631 +1,151 @@
 from __future__ import annotations
 
-import copy
 import json
 import logging
-import math
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-import yaml
-import mlflow
 from orchestrator.belief_state import BeliefStateManager
-from orchestrator.control.policy import weighted_consensus
+from orchestrator.config import OrchestratorConfig, load_orchestrator_config
 from orchestrator.control.registry import load_registry, to_runtime_handles
-from orchestrator.control.scheduler import filter_by_capability, select_enabled_agents
+from orchestrator.control.scheduler import filter_by_capability
 from orchestrator.data_plane.a2a_client import A2AClient, A2AClientError
 from orchestrator.data_plane.state_sqlite import SQLiteStateBackend
-from orchestrator.observation_calibrator import ObservationModelCalibrator
+from orchestrator.decision import DecisionCosts, approximate_voi, select_expected_cost_action
 from orchestrator.preprocessing import OrchestratorPreprocessor
-from orchestrator.types import DecisionThresholds, FullBAOState
-from orchestrator.voi_router import VOIRouter
+
+logger = logging.getLogger("orchestrator")
 
 
 class IntegratedBAOSystem:
+    """Deterministic BAO runtime with posterior-first fusion and VOI gating."""
+
     def __init__(self, config_path: str | Path):
-        self.config_path = Path(config_path)
-        self.config = self._load_config(config_path)
+        self.config_obj: OrchestratorConfig = load_orchestrator_config(config_path)
+        self.config = self.config_obj.raw
+        self.config_path = self.config_obj.config_path
 
-        thresholds_cfg = self.config.get("thresholds", {})
-        self.thresholds = DecisionThresholds(
-            p_accept=float(thresholds_cfg.get("p_accept", 0.3)),
-            p_reject=float(thresholds_cfg.get("p_reject", 0.7)),
-            uncertainty=float(thresholds_cfg.get("uncertainty", 0.6)),
-        )
-
-        state_db = self.config.get("state", {}).get("sqlite_path", "artifacts/state/bao_state.sqlite")
-        self.state_backend = SQLiteStateBackend(state_db)
-
-        drift_cfg = self.config.get("drift", {})
+        self.state_backend = SQLiteStateBackend(self.config_obj.state.sqlite_path)
+        drift_cfg = self.config.get("drift", {}) if isinstance(self.config, dict) else {}
         self.belief_manager = BeliefStateManager(
             drift_window=int(drift_cfg.get("window", 10)),
             drift_threshold=float(drift_cfg.get("threshold", 0.08)),
             backend=self.state_backend,
+            eps=self.config_obj.belief.eps,
         )
-        self.calibrator = ObservationModelCalibrator()
 
-        registry_path = self._resolve_registry_path()
-        registry = load_registry(registry_path)
-        self.registry_routing = registry.get("routing", {})
+        self.preprocessor = OrchestratorPreprocessor(schema_path=self.config_obj.preprocessing.schema_path)
+        self.a2a = A2AClient(retries=self.config_obj.a2a.retries)
+
+        registry = load_registry(self.config_obj.orchestration.agent_registry_path)
+        self.registry_routing = dict(registry.get("routing", {}))
         self.agent_handles = to_runtime_handles(registry)
-
-        self.a2a = A2AClient(retries=int(self.config.get("a2a", {}).get("retries", 0)))
 
         if bool(self.registry_routing.get("require_healthy", True)):
             self._apply_health_filter()
 
-        default_agents = list(self.registry_routing.get("default_agents", []))
-        self.default_agents = select_enabled_agents(self.agent_handles, default_agents)
-        if bool(self.registry_routing.get("require_healthy", True)):
-            missing_defaults = [aid for aid in default_agents if aid not in self.default_agents]
-            if missing_defaults:
-                raise RuntimeError(
-                    f"Default agents unavailable/unhealthy at startup: {missing_defaults}"
-                )
-        if not self.default_agents:
-            raise RuntimeError("No available agents after registry/health initialization")
+        self.agent_sequence = self._resolve_agent_sequence()
+        if not self.agent_sequence:
+            raise RuntimeError("No available agents after registry/health filtering")
 
-        costs = self.config.get("costs", {})
-        self.voi_router = VOIRouter(
-            agents={aid: self.agent_handles[aid] for aid in self.default_agents},
-            observation_models=self.calibrator.models,
-            c_fn=float(costs.get("c_fn", 50.0)),
-            c_fp=float(costs.get("c_fp", 5.0)),
-            c_h=float(costs.get("c_h", 500.0)),
-            use_surrogate=bool(self.config.get("voi", {}).get("use_surrogate", True)),
-            allow_exact=bool(self.config.get("voi", {}).get("allow_exact", False)),
+        self.metrics_output_path = self.config_obj.logging.jsonl_path
+        self.metrics_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.config_obj.fusion.method != "logit_pool":
+            raise ValueError(f"unsupported fusion.method={self.config_obj.fusion.method!r}")
+        if self.config_obj.decision.policy != "expected_cost_min":
+            raise ValueError(f"unsupported decision.policy={self.config_obj.decision.policy!r}")
+
+        self.decision_costs = DecisionCosts(
+            c_fn=float(self.config_obj.decision.c_fn),
+            c_fp=float(self.config_obj.decision.c_fp),
+            c_h=float(self.config_obj.decision.c_h),
         )
-
-        # Initialize preprocessor with schema from config
-        pre_cfg = self.config.get("preprocessing", {})
-        schema_path = pre_cfg.get("schema_path")
-        if schema_path and not Path(schema_path).is_absolute():
-            schema_path = (self.config_path.parent / schema_path).resolve()
-        self.preprocessor = OrchestratorPreprocessor(schema_path=schema_path)
 
         self.metrics = {
             "flows_processed": 0,
-            "decisions": {"accept": 0, "reject": 0, "defer": 0, "more_agents": 0},
-            "agent_calls": {aid: 0 for aid in self.default_agents},
+            "decisions": {"accept": 0, "reject": 0, "defer": 0},
+            "agent_calls": {aid: 0 for aid in self.agent_sequence},
             "total_cost": 0.0,
-            "drift_count": 0,
             "hitl_count": 0,
         }
-
-        self.metrics_output_path = Path(self.config.get("logging", {}).get("jsonl_path", "artifacts/replay/flows.jsonl"))
-        self.metrics_output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self.mlflow_enabled = bool(self.config.get("logging", {}).get("enable_mlflow", False))
-        self._mlflow = None
-        if self.mlflow_enabled:
-            try:
-                self._mlflow = mlflow
-            except Exception:
-                self._mlflow = None
-
-        try:
-            from langgraph.graph import END, StateGraph
-        except Exception as exc:
-            raise RuntimeError("langgraph is required to run IntegratedBAOSystem; install langgraph>=0.2") from exc
-
-        self._END = END
-        self._StateGraph = StateGraph
-        self.graph, self.graph_nodes = self._build_graph()
-
-    def _resolve_registry_path(self) -> Path:
-        configured = self.config.get("orchestration", {}).get("agent_registry_path")
-        if configured:
-            p = Path(configured)
-            if not p.is_absolute():
-                p = (self.config_path.parent / p).resolve()
-            return p
-        return (Path(__file__).resolve().parents[2] / "config" / "agents.yaml").resolve()
 
     def _apply_health_filter(self) -> None:
         healthy = {}
         for aid, handle in self.agent_handles.items():
             try:
                 health = self.a2a.health(handle)
-                if str(health.get("status", "")).lower() == "ok":
-                    caps = self.a2a.capabilities(handle)
-                    if str(caps.get("agent_id", "")) == aid:
-                        healthy[aid] = handle
+                if str(health.get("status", "")).lower() != "ok":
+                    continue
+                caps = self.a2a.capabilities(handle)
+                if str(caps.get("agent_id", "")) != aid:
+                    continue
+                healthy[aid] = handle
             except Exception:
                 continue
         self.agent_handles = healthy
 
-    def _load_config(self, config_path: str | Path) -> Dict[str, Any]:
-        config_path = Path(config_path)
-        with open(config_path) as f:
-            if config_path.suffix in (".yaml", ".yml"):
-                return yaml.safe_load(f) or {}
-            return json.load(f)
+    def _resolve_agent_sequence(self) -> List[str]:
+        configured = list(self.config_obj.orchestration.agent_sequence)
+        if not configured:
+            configured = list(self.registry_routing.get("default_agents", []))
+        if not configured:
+            configured = list(self.agent_handles.keys())
 
-    def _build_graph(self):
-        workflow = self._StateGraph(FullBAOState)
-        nodes = [
-            "initialize",
-            "load_belief",
-            "compute_voi",
-            "select_agent",
-            "call_agent",
-            "update_belief",
-            "check_drift",
-            "calibrate",
-            "check_uncertainty",
-            "consensus",
-            "make_decision",
-            "defer_hitl",
-            "execute_action",
-            "collect_feedback",
-            "update_models",
-            "log_metrics",
-        ]
+        seen = set()
+        sequence: List[str] = []
+        for aid in configured:
+            if aid in seen:
+                continue
+            if aid not in self.agent_handles:
+                continue
+            seen.add(aid)
+            sequence.append(aid)
+        return sequence
 
-        workflow.add_node("initialize", self._initialize_state)
-        workflow.add_node("load_belief", self._load_belief)
-        workflow.add_node("compute_voi", self._compute_voi)
-        workflow.add_node("select_agent", self._select_agent)
-        workflow.add_node("call_agent", self._call_agent)
-        workflow.add_node("update_belief", self._update_belief)
-        workflow.add_node("check_drift", self._check_drift)
-        workflow.add_node("calibrate", self._calibrate)
-        workflow.add_node("check_uncertainty", self._check_uncertainty)
-        workflow.add_node("consensus", self._consensus)
-        workflow.add_node("make_decision", self._make_decision)
-        workflow.add_node("defer_hitl", self._defer_hitl)
-        workflow.add_node("execute_action", self._execute_action)
-        workflow.add_node("collect_feedback", self._collect_feedback)
-        workflow.add_node("update_models", self._update_models)
-        workflow.add_node("log_metrics", self._log_metrics)
+    def _agent_weight(self, agent_id: str) -> float:
+        return max(1e-6, float(self.config_obj.fusion.agent_weights.get(agent_id, 1.0)))
 
-        workflow.set_entry_point("initialize")
-        workflow.add_edge("initialize", "load_belief")
-        workflow.add_edge("load_belief", "compute_voi")
+    def _candidate_agents(self, flow_features: Dict[str, Any]) -> List[str]:
+        required_caps = list(flow_features.get("required_capabilities", []))
+        candidates = filter_by_capability(self.agent_sequence, self.agent_handles, required_caps)
+        max_agents = min(int(self.config_obj.query.max_agents), len(candidates))
+        return candidates[:max_agents]
 
-        workflow.add_conditional_edges(
-            "compute_voi",
-            self._route_after_voi,
-            {"query": "select_agent", "check": "check_uncertainty"},
+    def _query_decision(self, p_mal: float, uncertainty: float, next_agent_cost: float) -> tuple[bool, float]:
+        if uncertainty <= float(self.config_obj.query.uncertainty_threshold):
+            return False, 0.0
+
+        if not self.config_obj.voi.enabled:
+            return True, 0.0
+
+        voi = approximate_voi(
+            p_mal=p_mal,
+            costs=self.decision_costs,
+            rho=float(self.config_obj.voi.rho),
         )
+        return voi > float(next_agent_cost), voi
 
-        workflow.add_edge("select_agent", "call_agent")
-        workflow.add_edge("call_agent", "update_belief")
-        workflow.add_edge("update_belief", "check_drift")
-
-        workflow.add_conditional_edges(
-            "check_drift",
-            self._route_after_drift,
-            {"calibrate": "calibrate", "loop": "compute_voi", "check": "check_uncertainty"},
-        )
-
-        workflow.add_edge("calibrate", "compute_voi")
-
-        workflow.add_conditional_edges(
-            "check_uncertainty",
-            self._route_after_uncertainty,
-            {"consensus": "consensus", "decide": "make_decision"},
-        )
-
-        workflow.add_edge("consensus", "make_decision")
-
-        def _route_after_decision(s: FullBAOState) -> str:
-            if s["decision"] == "defer":
-                return "defer"
-            if s["decision"] == "more_agents":
-                return "more_agents"
-            return "act"
-
-        workflow.add_conditional_edges(
-            "make_decision",
-            _route_after_decision,
-            {"defer": "defer_hitl", "more_agents": "compute_voi", "act": "execute_action"},
-        )
-
-        workflow.add_edge("defer_hitl", "collect_feedback")
-        workflow.add_edge("execute_action", "collect_feedback")
-        workflow.add_edge("collect_feedback", "update_models")
-        workflow.add_edge("update_models", "log_metrics")
-        workflow.add_edge("log_metrics", self._END)
-
-        return workflow.compile(), nodes
-
-    async def _initialize_state(self, state: FullBAOState) -> FullBAOState:
-        state["agents_available"] = list(self.default_agents)
-        state["agents_queried"] = []
-        state["agent_outputs"] = []
-        state["voi_scores"] = {}
-        state["selected_agent"] = None
-        state["selected_voi"] = None
-        state["voi_should_query"] = True
-        state["iteration"] = 0
-        # Exhaust all agents before human deferral (high cost of human review)
-        max_agents = len(state["agents_available"])
-        state["max_iterations"] = int(self.config.get("orchestration", {}).get("max_iterations", max_agents))
-
-        # Prior: 0.1% base attack rate (logit(0.001) = -6.907)
-        
-        base_attack_rate = 0.55
-        state["compromise_prob"] = base_attack_rate
-        state["belief_mu"] = math.log(base_attack_rate / (1.0 - base_attack_rate))
-        state["belief_var"] = 1.0
-        # state["epistemic_uncertainty"] = 0.69314718056
-        p = state["compromise_prob"]
-        if p in (0.0, 1.0):
-            state["epistemic_uncertainty"] = 0.0
-        else:
-            # Binary cross-entropy in nats
-            state["epistemic_uncertainty"] = -(p * math.log(p) + (1 - p) * math.log(1 - p))
-        state["agent_reliabilities"] = {}
-
-        state["drift_detected"] = False
-        state["drift_score"] = 0.0
-        state["needs_calibration"] = False
-        state["consensus_triggered"] = False
-        state["consensus_result"] = {"agreement": 1.0, "probability": state["compromise_prob"], "participants": []}
-
-        state["decision"] = None
-        state["decision_reasoning"] = []
-        state["hitl_context"] = None
-
-        state["inference_time_ms"] = 0.0
-        state["cumulative_cost"] = 0.0
-        state["confidence"] = 0.0
-        state["total_time_ms"] = 0.0
-        return state
-
-    async def _load_belief(self, state: FullBAOState) -> FullBAOState:
-        belief = self.belief_manager.get_or_create_belief(state["flow_id"])
-        state["belief_mu"] = belief.mu
-        state["belief_var"] = belief.get_variance()
-        state["compromise_prob"] = belief.get_compromise_prob()
-        state["epistemic_uncertainty"] = belief.get_epistemic_uncertainty()
-        state["agent_reliabilities"] = {
-            aid: self.belief_manager.get_global_reliability(aid) for aid in state["agents_available"]
-        }
-        return state
-
-    async def _compute_voi(self, state: FullBAOState) -> FullBAOState:
-        t0 = time.perf_counter()
-        belief = self.belief_manager.get_belief(state["flow_id"])
-        if belief is None:
-            belief = self.belief_manager.get_or_create_belief(state["flow_id"])
-
-        requested_caps = list(state["flow_features"].get("required_capabilities", []))
-        candidate_agents = filter_by_capability(state["agents_available"], self.agent_handles, requested_caps)
-
-        best_agent, best_voi, scores = self.voi_router.select_best_agent(
-            belief_state=belief,
-            flow_features=state["flow_features"],
-            queried_agents=[a for a in state["agents_queried"] if a in candidate_agents],
-        )
-        state["voi_scores"] = {aid: s for aid, s in scores.items() if aid in candidate_agents}
-        state["voi_should_query"] = best_agent is not None
-        state["inference_time_ms"] += (time.perf_counter() - t0) * 1000.0
-        return state
-
-    def _route_after_voi(self, state: FullBAOState) -> str:
-        logging.debug("[VOI_ROUTE] flow_id=%s, iteration=%d/%d, queried=%s, voi_scores=%s", 
-                     state["flow_id"], state["iteration"], state["max_iterations"], 
-                     state["agents_queried"], state["voi_scores"])
-        if state["iteration"] == 0 and not state["agents_queried"] and state["agents_available"]:
-            return "query"
-        if state["iteration"] >= state["max_iterations"]:
-            logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, reached max iterations (%d), stopping with MULTIPLE agents: %s", 
-                        state["flow_id"], state["max_iterations"], state["agents_queried"])
-            return "check"
-        if not state["voi_scores"]:
-            logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, no more agents available, stopping with: %s", 
-                        state["flow_id"], state["agents_queried"])
-            return "check"
-        
-        best_agent = max(state["voi_scores"], key=state["voi_scores"].get)
-        best_voi = state["voi_scores"][best_agent]
-        
-        if state.get("voi_should_query", False):
-            if state["iteration"] == 1:
-                logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, VOI=%.4f (exploration) after 1 agent, deciding to use MULTIPLE agents. Next: %s", 
-                            state["flow_id"], best_voi, best_agent)
-            else:
-                logging.info("[VOI_POSITIVE] flow_id=%s, iteration=%d, selecting next agent=%s, voi=%.4f", 
-                            state["flow_id"], state["iteration"], best_agent, best_voi)
-            return "query"
-        
-        if state["iteration"] == 1:
-            logging.info("[ORCHESTRATOR_DECISION] flow_id=%s, VOI <= 0 after 1 agent, deciding to use SINGLE agent: %s", 
-                        state["flow_id"], state["agents_queried"])
-        else:
-            logging.info("[VOI_NEGATIVE] flow_id=%s, stopping after %d agents: %s", 
-                        state["flow_id"], state["iteration"], state["agents_queried"])
-        return "check"
-
-    async def _select_agent(self, state: FullBAOState) -> FullBAOState:
-        if not state["voi_scores"]:
-            state["selected_agent"] = None
-            state["selected_voi"] = None
-            return state
-        best = max(state["voi_scores"], key=state["voi_scores"].get)
-        state["selected_agent"] = best
-        state["selected_voi"] = state["voi_scores"][best]
-        state["decision_reasoning"].append(f"selected={best},voi={state['selected_voi']:.4f}")
-        return state
-
-    async def _call_agent(self, state: FullBAOState) -> FullBAOState:
-        t0 = time.perf_counter()
-        aid = state["selected_agent"]
-        if aid is None or aid not in self.agent_handles:
-            logging.warning("No agent selected or agent not found: %s", aid)
-            return state
-
-        handle = self.agent_handles[aid]
-        payload = {
+    def _build_payload(self, flow_id: str, timestamp: float, flow_features: Dict[str, Any], p_mal: float, uncertainty: float) -> Dict[str, Any]:
+        return {
             "request_id": str(uuid.uuid4()),
-            "flow_id": state["flow_id"],
-            "timestamp": state["timestamp"],
-            "flow_features": state["flow_features"],
+            "flow_id": flow_id,
+            "timestamp": timestamp,
+            "flow_features": flow_features,
             "context": {
-                "belief": {
-                    "p_mal": state["compromise_prob"],
-                    "uncertainty": state["epistemic_uncertainty"],
-                },
-                "requested_capabilities": state["flow_features"].get("required_capabilities", []),
+                "belief": {"p_mal": p_mal, "uncertainty": uncertainty},
+                "requested_capabilities": list(flow_features.get("required_capabilities", [])),
                 "elicit_likelihood": True,
-                "seed": int(self.config.get("orchestration", {}).get("seed", 0)),
+                "seed": int(self.config_obj.orchestration.seed),
             },
         }
 
-        logging.info("[AGENT_CALL] flow_id=%s, agent=%s, iteration=%d, current_p_mal=%.4f", 
-                    state["flow_id"], aid, state["iteration"], state["compromise_prob"])
-
-        try:
-            output = self.a2a.infer(handle, payload)
-            # If the agent provided elicited likelihoods, convert to a posterior proba
-            if isinstance(output, dict) and output.get("likelihoods"):
-                l = output.get("likelihoods") or {}
-                p_a = float(l.get("p_obs_given_attack", l.get("p_attack", l.get("p_given_attack", 0.5))))
-                p_c = float(l.get("p_obs_given_clean", l.get("p_clean", l.get("p_given_clean", 0.5))))
-                p_a = max(1e-9, min(1.0, p_a))
-                p_c = max(1e-9, min(1.0, p_c))
-                prior = float(state.get("compromise_prob", 0.001))
-                denom = prior * p_a + (1.0 - prior) * p_c
-                posterior = prior if denom <= 0 else (prior * p_a) / denom
-                posterior = max(1e-6, min(1.0 - 1e-6, posterior))
-                output["proba"] = [1.0 - posterior, posterior]
-                output["_elicited_likelihoods"] = {"p_obs_given_attack": p_a, "p_obs_given_clean": p_c}
-            logging.info("[AGENT_RESPONSE] flow_id=%s, agent=%s, proba=%s, cost=%.2f", 
-                        state["flow_id"], aid, output.get("proba"), float(handle.cost))
-        except A2AClientError:
-            logging.error("[AGENT_FAILED] flow_id=%s, agent=%s", state["flow_id"], aid)
-            if aid in state["agents_available"]:
-                state["agents_available"] = [x for x in state["agents_available"] if x != aid]
-            state["decision_reasoning"].append(f"agent_failed={aid}")
-            return state
-
-        state["agent_outputs"].append(output)
-        state["agents_queried"].append(aid)
-        state["iteration"] += 1
-        state["cumulative_cost"] += float(handle.cost)
-
-        if aid in self.metrics["agent_calls"]:
-            self.metrics["agent_calls"][aid] += 1
-        else:
-            self.metrics["agent_calls"][aid] = 1
-
-        state["inference_time_ms"] += (time.perf_counter() - t0) * 1000.0
-        return state
-
-    async def _update_belief(self, state: FullBAOState) -> FullBAOState:
-        if not state["agent_outputs"]:
-            return state
-        t0 = time.perf_counter()
-
-        belief = self.belief_manager.get_or_create_belief(state["flow_id"])
-        output = dict(state["agent_outputs"][-1])
-        agent_id = state["agents_queried"][-1]
-
-        model = self.calibrator.get_or_create_model(agent_id)
-        p_raw = float(output.get("proba", [0.5, 0.5])[1])
-        p_cal = model.calibrate_proba(p_raw)
-        output["proba"] = [1.0 - p_cal, p_cal]
-        state["agent_outputs"][-1] = output
-
-        updated = belief.variational_update(
-            output,
-            agent_id=agent_id,
-            learning_rate=float(self.config.get("orchestration", {}).get("learning_rate", 1.0)),
-            use_natural_gradient=False,
-        )
-        self.belief_manager.persist_belief(state["flow_id"])
-
-        state["belief_mu"] = float(updated["mu"])
-        state["belief_var"] = float(updated["var"])
-        state["compromise_prob"] = float(updated["compromise_prob"])
-        logging.info("[BELIEF_UPDATE] flow_id=%s, agent=%s, p_mal: %.4f -> %.4f, uncertainty: %.4f -> %.4f",
-                        state["flow_id"], agent_id,
-                        belief.get_compromise_prob(), state["compromise_prob"],
-                        belief.get_epistemic_uncertainty(), state["epistemic_uncertainty"])
-        state["epistemic_uncertainty"] = float(updated["epistemic_uncertainty"])
-        state["confidence"] = float(max(state["compromise_prob"], 1.0 - state["compromise_prob"]))
-        state["decision_reasoning"].append(
-            f"update:p={state['compromise_prob']:.4f},h={state['epistemic_uncertainty']:.4f}"
-        )
-
-        state["inference_time_ms"] += (time.perf_counter() - t0) * 1000.0
-        return state
-
-    async def _check_drift(self, state: FullBAOState) -> FullBAOState:
-        belief = self.belief_manager.get_or_create_belief(state["flow_id"])
-        stats = belief.detect_drift()
-        state["drift_detected"] = bool(stats.drift_detected)
-        state["drift_score"] = float(stats.drift_score)
-        state["needs_calibration"] = bool(stats.drift_detected)
-
-        if stats.drift_detected:
-            self.metrics["drift_count"] += 1
-            state["decision_reasoning"].append(f"drift={stats.drift_score:.4f}")
-        return state
-
-    def _route_after_drift(self, state: FullBAOState) -> str:
-        if state["needs_calibration"]:
-            return "calibrate"
-        remaining = [a for a in state["agents_available"] if a not in state["agents_queried"]]
-        # Always recompute VOI with the updated belief after each agent call.
-        # Let _route_after_voi be the single decision point on whether to query more.
-        # Never use stale voi_scores here to gate the loop.
-        if state["iteration"] < state["max_iterations"] and remaining:
-            return "loop"
-        return "check"
-
-    async def _calibrate(self, state: FullBAOState) -> FullBAOState:
-        for aid in state["agents_queried"]:
-            model = self.calibrator.get_or_create_model(aid)
-            model.refit_from_experience()
-        state["decision_reasoning"].append("calibrated")
-        return state
-
-    async def _check_uncertainty(self, state: FullBAOState) -> FullBAOState:
-        return state
-
-    def _route_after_uncertainty(self, state: FullBAOState) -> str:
-        thresh = float(self.thresholds.uncertainty)
-        if (
-            state["epistemic_uncertainty"] > thresh
-            and not state["consensus_triggered"]
-            and len(state["agent_outputs"]) >= 1
-        ):
-            return "consensus"
-        return "decide"
-
-    async def _consensus(self, state: FullBAOState) -> FullBAOState:
-        reliability_lookup = {
-            aid: self.belief_manager.get_global_reliability(aid) for aid in state["agents_available"]
-        }
-        result = weighted_consensus(state["agent_outputs"], reliability_lookup)
-
-        belief = self.belief_manager.get_or_create_belief(state["flow_id"])
-        belief.set_compromise_prob(float(result["probability"]))
-        self.belief_manager.persist_belief(state["flow_id"])
-
-        state["compromise_prob"] = float(result["probability"])
-        state["epistemic_uncertainty"] = belief.get_epistemic_uncertainty()
-        state["consensus_triggered"] = True
-        state["consensus_result"] = result
-        state["decision_reasoning"].append(
-            f"consensus:p={state['compromise_prob']:.4f},agreement={result['agreement']:.4f}"
-        )
-        return state
-
-    async def _make_decision(self, state: FullBAOState) -> FullBAOState:
-        belief = self.belief_manager.get_or_create_belief(state["flow_id"])
-        p = belief.get_compromise_prob()
-        h = belief.get_epistemic_uncertainty()
-
-        local_thresholds = copy.copy(self.thresholds)
-        if state["consensus_triggered"]:
-            agreement = float(state["consensus_result"].get("agreement", 1.0))
-            if agreement < 0.7:
-                local_thresholds = DecisionThresholds(
-                    p_accept=self.thresholds.p_accept,
-                    p_reject=self.thresholds.p_reject,
-                    uncertainty=self.thresholds.uncertainty * 0.85,
-                )
-
-        remaining_agents = [a for a in state["agents_available"] if a not in state["agents_queried"]]
-        # If we've reached make_decision, _route_after_voi already determined no further
-        # queries are worth it. has_more_agents is always False here to avoid more_agents
-        # cycling back into a VOI check that will just return "check" again.
-        has_more_agents = False
-        decision = local_thresholds.decide(p, h, has_more_agents=has_more_agents)
-        
-        # Summary of agent usage strategy
-        num_queried = len(state["agents_queried"])
-        agent_strategy = "single-agent" if num_queried == 1 else "multi-agent" if num_queried > 1 else "no-agent"
-        logging.info("[ORCHESTRATOR_STRATEGY] flow_id=%s, strategy=%s, agents=%s, final_p_mal=%.4f, final_uncertainty=%.4f", 
-                    state["flow_id"], agent_strategy, state["agents_queried"], p, h)
-
-        logging.info("[DECISION] flow_id=%s, decision=%s, p_mal=%.4f, uncertainty=%.4f, has_more_agents=%s, iteration=%d/%d", 
-                    state["flow_id"], decision, p, h, has_more_agents, state["iteration"], state["max_iterations"])
-        
-        state["decision"] = decision
-        state["confidence"] = max(p, 1.0 - p)
-        state["decision_reasoning"].append(f"decision={decision},p={p:.4f},h={h:.4f}")
-        return state
-
-    async def _defer_hitl(self, state: FullBAOState) -> FullBAOState:
-        state["hitl_context"] = {
-            "flow_id": state["flow_id"],
-            "compromise_prob": state["compromise_prob"],
-            "epistemic_uncertainty": state["epistemic_uncertainty"],
-            "agents_queried": state["agents_queried"],
-            "agent_outputs": state["agent_outputs"],
-            "reasoning": state["decision_reasoning"],
-        }
-        self.metrics["hitl_count"] += 1
-        return state
-
-    async def _execute_action(self, state: FullBAOState) -> FullBAOState:
-        return state
-
-    async def _collect_feedback(self, state: FullBAOState) -> FullBAOState:
-        return state
-
-    async def _update_models(self, state: FullBAOState) -> FullBAOState:
-        true_label = state.get("true_label")
-        if true_label is None:
-            return state
-
-        belief = self.belief_manager.get_or_create_belief(state["flow_id"])
-        for aid, out in zip(state["agents_queried"], state["agent_outputs"]):
-            pred = 1 if out["proba"][1] >= 0.5 else 0
-            belief.update_agent_reliability(aid, pred, int(true_label))
-            self.belief_manager.update_global_reliabilities(aid, pred == int(true_label))
-            self.calibrator.online_update(aid, out, int(true_label))
-            self.state_backend.update_observation_stats(
-                aid,
-                {
-                    "true_label": int(true_label),
-                    "pred": pred,
-                    "proba": float(out["proba"][1]),
-                    "timestamp": time.time(),
-                },
-            )
-        self.belief_manager.persist_belief(state["flow_id"])
-        return state
-
-    async def _log_metrics(self, state: FullBAOState) -> FullBAOState:
-        state["total_time_ms"] = state["inference_time_ms"]
-
-        decision = state.get("decision") or "defer"
-        self.metrics["flows_processed"] += 1
-        self.metrics["decisions"][decision] += 1
-        self.metrics["total_cost"] += state["cumulative_cost"]
-
-        event = {
-            "flow_id": state["flow_id"],
-            "timestamp": state.get("timestamp", time.time()),
-            "decision": state["decision"],
-            "compromise_prob": state["compromise_prob"],
-            "epistemic_uncertainty": state["epistemic_uncertainty"],
-            "cumulative_cost": state["cumulative_cost"],
-            "agents_queried": state["agents_queried"],
-            "voi_scores": state.get("voi_scores", {}),
-            "confidence": state["confidence"],
-            "drift_detected": state["drift_detected"],
-        }
-        with open(self.metrics_output_path, "a") as f:
-            f.write(json.dumps(event) + "\n")
-
-        if self._mlflow is not None:
-            self._mlflow.log_metrics(
-                {
-                    "compromise_prob": state["compromise_prob"],
-                    "epistemic_uncertainty": state["epistemic_uncertainty"],
-                    "cumulative_cost": state["cumulative_cost"],
-                }
-            )
-        return state
+    def _clip_probability(self, value: Any) -> float:
+        p = float(value)
+        eps = self.config_obj.belief.eps
+        return max(eps, min(1.0 - eps, p))
 
     async def process_flow(
         self,
@@ -634,27 +154,167 @@ class IntegratedBAOSystem:
         timestamp: float,
         true_label: Optional[int] = None,
     ) -> Dict[str, Any]:
-        # Preprocess features if preprocessor is configured
-        preprocessed_features = self.preprocessor.transform(flow_features) if self.preprocessor else flow_features
-        init_state: FullBAOState = {
+        t0 = time.perf_counter()
+        # Do not inject shared pp_* fields globally: each agent owns its own preprocessing.
+        # Shared preprocessing can distort other agents when schemas differ.
+        features = dict(flow_features)
+
+        candidates = self._candidate_agents(features)
+        belief = self.belief_manager.get_or_create_belief(
+            flow_id=flow_id,
+            prior_attack_rate=self.config_obj.belief.prior_attack_rate,
+        )
+
+        state: Dict[str, Any] = {
             "flow_id": flow_id,
-            "flow_features": preprocessed_features,
             "timestamp": timestamp,
             "true_label": true_label,
+            "flow_features": features,
+            "agents_available": list(candidates),
+            "agents_queried": [],
+            "agent_outputs": [],
+            "decision_reasoning": [],
+            "voi_scores": {},
+            "cumulative_cost": 0.0,
+            "iteration": 0,
+            "max_iterations": len(candidates),
+            "drift_detected": False,
+            "drift_score": 0.0,
+            "hitl_context": None,
+            "consensus_triggered": False,
+            "consensus_result": {},
+            "belief_mu": belief.mu,
+            "belief_var": belief.get_variance(),
+            "compromise_prob": belief.get_compromise_prob(),
+            "epistemic_uncertainty": belief.get_epistemic_uncertainty(),
+            "inference_time_ms": 0.0,
+            "total_time_ms": 0.0,
+            "confidence": max(belief.get_compromise_prob(), 1.0 - belief.get_compromise_prob()),
+            "decision": None,
         }
-        return await self.graph.ainvoke(
-            init_state,
-            config={"recursion_limit": max(50, len(self.default_agents) * 20)},
+
+        for idx, aid in enumerate(candidates):
+            handle = self.agent_handles[aid]
+            payload = self._build_payload(
+                flow_id=flow_id,
+                timestamp=timestamp,
+                flow_features=features,
+                p_mal=belief.get_compromise_prob(),
+                uncertainty=belief.get_epistemic_uncertainty(),
+            )
+
+            try:
+                output = self.a2a.infer(handle, payload)
+            except A2AClientError as exc:
+                state["decision_reasoning"].append(f"agent_failed={aid}:{exc}")
+                continue
+
+            p_agent = self._clip_probability((output.get("proba") or [0.5, 0.5])[1])
+            output["proba"] = [1.0 - p_agent, p_agent]
+
+            weight = self._agent_weight(aid)
+            updated = belief.update_from_agent_output(
+                agent_output=output,
+                agent_id=aid,
+                update_mode=self.config_obj.orchestration.update_mode,
+                weight=weight,
+                eps=self.config_obj.belief.eps,
+                likelihood_sanity_gate=self.config_obj.belief.likelihood_sanity_gate,
+            )
+
+            state["agents_queried"].append(aid)
+            state["agent_outputs"].append(output)
+            state["iteration"] += 1
+            state["cumulative_cost"] += float(handle.cost)
+            state["belief_mu"] = float(updated["mu"])
+            state["belief_var"] = float(updated["var"])
+            state["compromise_prob"] = float(updated["compromise_prob"])
+            state["epistemic_uncertainty"] = float(updated["epistemic_uncertainty"])
+            state["confidence"] = max(state["compromise_prob"], 1.0 - state["compromise_prob"])
+
+            self.metrics["agent_calls"][aid] = self.metrics["agent_calls"].get(aid, 0) + 1
+            state["decision_reasoning"].append(
+                f"agent={aid},p_agent={p_agent:.6f},p_post={state['compromise_prob']:.6f},h={state['epistemic_uncertainty']:.6f}"
+            )
+
+            if idx + 1 >= len(candidates):
+                break
+
+            next_agent = candidates[idx + 1]
+            should_query, voi_value = self._query_decision(
+                p_mal=state["compromise_prob"],
+                uncertainty=state["epistemic_uncertainty"],
+                next_agent_cost=float(self.agent_handles[next_agent].cost),
+            )
+            state["voi_scores"][next_agent] = float(voi_value)
+            if not should_query:
+                state["decision_reasoning"].append(
+                    f"stop_after={aid},voi={voi_value:.6f},next_cost={float(self.agent_handles[next_agent].cost):.6f}"
+                )
+                break
+
+        final_p = float(belief.get_compromise_prob())
+        decision, action_costs = select_expected_cost_action(final_p, self.decision_costs)
+
+        state["decision"] = decision
+        state["compromise_prob"] = final_p
+        state["epistemic_uncertainty"] = float(belief.get_epistemic_uncertainty())
+        state["confidence"] = max(final_p, 1.0 - final_p)
+        state["decision_reasoning"].append(
+            f"decision={decision},cost_accept={action_costs['accept']:.6f},cost_reject={action_costs['reject']:.6f},cost_defer={action_costs['defer']:.6f}"
         )
+
+        if true_label is not None:
+            y_true = int(true_label)
+            for aid, output in zip(state["agents_queried"], state["agent_outputs"]):
+                pred = 1 if float(output["proba"][1]) >= 0.5 else 0
+                belief.update_agent_reliability(aid, pred, y_true)
+                self.belief_manager.update_global_reliabilities(aid, pred == y_true)
+                self.state_backend.update_observation_stats(
+                    aid,
+                    {
+                        "true_label": y_true,
+                        "pred": pred,
+                        "proba": float(output["proba"][1]),
+                        "timestamp": time.time(),
+                    },
+                )
+
+        self.belief_manager.persist_belief(flow_id)
+
+        state["inference_time_ms"] = (time.perf_counter() - t0) * 1000.0
+        state["total_time_ms"] = state["inference_time_ms"]
+
+        self.metrics["flows_processed"] += 1
+        self.metrics["total_cost"] += float(state["cumulative_cost"])
+        if decision not in self.metrics["decisions"]:
+            self.metrics["decisions"][decision] = 0
+        self.metrics["decisions"][decision] += 1
+        if decision == "defer":
+            self.metrics["hitl_count"] += 1
+
+        event = {
+            "flow_id": flow_id,
+            "timestamp": timestamp,
+            "decision": decision,
+            "compromise_prob": state["compromise_prob"],
+            "epistemic_uncertainty": state["epistemic_uncertainty"],
+            "cumulative_cost": state["cumulative_cost"],
+            "agents_queried": state["agents_queried"],
+            "voi_scores": state["voi_scores"],
+            "confidence": state["confidence"],
+        }
+        with self.metrics_output_path.open("a") as f:
+            f.write(json.dumps(event) + "\n")
+
+        return state
 
     def get_system_statistics(self) -> Dict[str, Any]:
         n = max(1, self.metrics["flows_processed"])
         return {
             "flows_processed": self.metrics["flows_processed"],
-            "decision_counts": self.metrics["decisions"],
+            "decision_counts": dict(self.metrics["decisions"]),
             "avg_cost_per_flow": self.metrics["total_cost"] / n,
             "hitl_count": self.metrics["hitl_count"],
-            "drift_count": self.metrics["drift_count"],
-            "agent_utilization": {k: v / n for k, v in self.metrics["agent_calls"].items()},
-            "observation_model_stats": self.calibrator.get_all_statistics(),
+            "agent_utilization": {aid: calls / n for aid, calls in self.metrics["agent_calls"].items()},
         }

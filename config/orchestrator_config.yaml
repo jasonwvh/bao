@@ -1,18 +1,37 @@
-thresholds:
-  p_accept: 0.45
-  p_reject: 0.55
-  uncertainty: 0.85
-
-costs:
-  c_fn: 500.0
-  c_fp: 5.0
-  c_h: 5000.0
-
 orchestration:
-  max_iterations: 2
-  learning_rate: 1.0
   seed: 7
   agent_registry_path: agents.yaml
+  update_mode: posterior_first
+  agent_sequence: []
+
+belief:
+  prior_attack_rate: 0.5
+  eps: 1.0e-6
+  likelihood_sanity_gate: true
+
+fusion:
+  method: logit_pool
+  agent_weights: {}
+
+decision:
+  policy: expected_cost_min
+  costs:
+    c_fn: 500.0
+    c_fp: 5.0
+    c_h: 5000.0
+
+query:
+  uncertainty_threshold: 0.6
+  max_agents: 2
+
+voi:
+  enabled: true
+  rho: 0.7
+
+benchmark:
+  reset_state: true
+  prediction_source: decision
+  write_manifest: true
 
 preprocessing:
   schema_path: ../agents/lstm_autoencoder/models/lstm_autoencoder.schema.json
@@ -22,16 +41,8 @@ a2a:
   a2a_version: v1
 
 state:
-  sqlite_path: artifacts/state/bao_state.sqlite
-
-voi:
-  use_surrogate: true
-  allow_exact: true
-
-drift:
-  window: 20
-  threshold: 0.08
+  sqlite_path: ../artifacts/state/bao_state.sqlite
 
 logging:
-  jsonl_path: artifacts/replay/flows.jsonl
+  jsonl_path: ../artifacts/replay/flows.jsonl
   enable_mlflow: false

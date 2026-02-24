@@ -8,6 +8,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict, List
 
 import yaml
 
@@ -15,21 +16,24 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmark.metrics import compute_metrics
+from benchmark.runner import (
+    BenchmarkAccumulator,
+    build_benchmark_manifest,
+    dataset_composition,
+    reset_sqlite_state,
+    write_json,
+)
+from orchestrator.config import PREDICTION_SOURCES, load_orchestrator_config
 from orchestrator.data.replay import load_replay_dataset
 from orchestrator.integrated_system import IntegratedBAOSystem
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """Configure logging for orchestrator and agents."""
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # Ensure orchestrator and agent loggers are enabled
-    for logger_name in ["orchestrator", "autoencoder", "isolation_forest", "llm"]:
-        logging.getLogger(logger_name).setLevel(level)
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,38 +43,99 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
     p.add_argument("--seed", type=int, default=7, help="Seed")
+    p.add_argument("--max-agents", type=int, default=None, help="Override query.max_agents")
+    p.add_argument(
+        "--agent-sequence",
+        default=None,
+        help="Comma-separated agent sequence override (e.g. lstm_autoencoder,ocsvm)",
+    )
+    p.add_argument(
+        "--update-mode",
+        choices=["posterior_first", "likelihood_strict"],
+        default=None,
+        help="Override orchestration update mode",
+    )
+    p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default=None)
+    p.add_argument("--diagnostic-dataset", default=None, help="Optional secondary replay dataset")
+    p.add_argument("--reset-state", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=None)
     return p.parse_args()
 
 
-async def _run(args: argparse.Namespace) -> None:
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _apply_overrides(raw_config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    cfg = dict(raw_config)
 
-    rows = load_replay_dataset(args.dataset, max_rows=(args.max_flows or None))
-    if not rows:
-        raise RuntimeError("No rows loaded from dataset")
+    orch = dict(cfg.get("orchestration", {}) or {})
+    orch["seed"] = int(args.seed)
+    if args.update_mode is not None:
+        orch["update_mode"] = str(args.update_mode)
+    if args.agent_sequence is not None:
+        orch["agent_sequence"] = [x.strip() for x in str(args.agent_sequence).split(",") if x.strip()]
+    cfg["orchestration"] = orch
 
-    config = yaml.safe_load(Path(args.config).read_text())
-    config.setdefault("orchestration", {})["seed"] = args.seed
-    if "agent_registry_path" in config.get("orchestration", {}):
-        reg_path = Path(config["orchestration"]["agent_registry_path"])
-        if not reg_path.is_absolute():
-            reg_path = (Path(args.config).resolve().parent / reg_path).resolve()
-        config["orchestration"]["agent_registry_path"] = str(reg_path)
+    benchmark = dict(cfg.get("benchmark", {}) or {})
+    if args.prediction_source is not None:
+        benchmark["prediction_source"] = str(args.prediction_source)
+    if args.reset_state is not None:
+        benchmark["reset_state"] = bool(args.reset_state)
+    if args.write_manifest is not None:
+        benchmark["write_manifest"] = bool(args.write_manifest)
+    cfg["benchmark"] = benchmark
 
-    runtime_config_path = output_dir / "effective_orchestrator_config.yaml"
-    runtime_config_path.write_text(yaml.dump(config, default_flow_style=False))
+    query = dict(cfg.get("query", {}) or {})
+    if args.max_agents is not None:
+        query["max_agents"] = int(args.max_agents)
+    cfg["query"] = query
 
-    system = IntegratedBAOSystem(config_path=runtime_config_path)
+    return cfg
 
-    results_path = output_dir / "replay_results.jsonl"
+
+def _absolutize_config_paths(config: Dict[str, Any], base_dir: Path) -> Dict[str, Any]:
+    cfg = dict(config)
+
+    orch = dict(cfg.get("orchestration", {}) or {})
+    if "agent_registry_path" in orch:
+        p = Path(str(orch["agent_registry_path"]))
+        if not p.is_absolute():
+            orch["agent_registry_path"] = str((base_dir / p).resolve())
+    cfg["orchestration"] = orch
+
+    state = dict(cfg.get("state", {}) or {})
+    if "sqlite_path" in state:
+        p = Path(str(state["sqlite_path"]))
+        if not p.is_absolute():
+            state["sqlite_path"] = str((base_dir / p).resolve())
+    cfg["state"] = state
+
+    logging_cfg = dict(cfg.get("logging", {}) or {})
+    if "jsonl_path" in logging_cfg:
+        p = Path(str(logging_cfg["jsonl_path"]))
+        if not p.is_absolute():
+            logging_cfg["jsonl_path"] = str((base_dir / p).resolve())
+    cfg["logging"] = logging_cfg
+
+    pre = dict(cfg.get("preprocessing", {}) or {})
+    if "schema_path" in pre and pre["schema_path"] not in (None, ""):
+        p = Path(str(pre["schema_path"]))
+        if not p.is_absolute():
+            pre["schema_path"] = str((base_dir / p).resolve())
+    cfg["preprocessing"] = pre
+
+    return cfg
+
+
+async def _run_dataset(
+    *,
+    system: IntegratedBAOSystem,
+    rows: List[Dict[str, Any]],
+    results_path: Path,
+    prediction_source: str,
+    approach: str,
+) -> Dict[str, Any]:
     if results_path.exists():
         results_path.unlink()
 
-    predictions: list[int] = []
-    labels: list[int] = []
-    probabilities: list[float] = []
-    costs: list[float] = []
+    acc = BenchmarkAccumulator(prediction_source=prediction_source)
 
     for row in rows:
         res = await system.process_flow(
@@ -79,6 +144,7 @@ async def _run(args: argparse.Namespace) -> None:
             timestamp=row.get("timestamp") or time.time(),
             true_label=row.get("true_label"),
         )
+
         compact = {
             "flow_id": row["flow_id"],
             "decision": res.get("decision"),
@@ -87,36 +153,111 @@ async def _run(args: argparse.Namespace) -> None:
             "cumulative_cost": res.get("cumulative_cost"),
             "agents_queried": res.get("agents_queried"),
         }
-        with open(results_path, "a") as f:
+        with results_path.open("a") as f:
             f.write(json.dumps(compact) + "\n")
 
         true_label = row.get("true_label")
-        if true_label is not None:
-            labels.append(int(true_label))
-            p_mal = float(res.get("compromise_prob", 0.5))
-            probabilities.append(p_mal)
-            predictions.append(1 if p_mal >= 0.5 else 0)
-            costs.append(float(res.get("cumulative_cost", 0.0)))
+        if true_label is None:
+            continue
+
+        acc.add_sample(
+            true_label=int(true_label),
+            probability=float(res.get("compromise_prob", 0.5)),
+            cost=float(res.get("cumulative_cost", 0.0)),
+            decision=res.get("decision"),
+        )
+
+    return acc.compute(approach=approach)
+
+
+async def _run(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    config_path = Path(args.config).resolve()
+    raw_config = yaml.safe_load(config_path.read_text()) or {}
+    config = _apply_overrides(raw_config, args)
+    config = _absolutize_config_paths(config, config_path.parent)
+
+    runtime_config_path = output_dir / "effective_orchestrator_config.yaml"
+    runtime_config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+
+    cfg = load_orchestrator_config(runtime_config_path)
+    if cfg.benchmark.reset_state:
+        reset_sqlite_state(cfg.state.sqlite_path)
+
+    rows = load_replay_dataset(args.dataset, max_rows=(args.max_flows or None))
+    if not rows:
+        raise RuntimeError("No rows loaded from dataset")
+
+    system = IntegratedBAOSystem(config_path=runtime_config_path)
+
+    results_path = output_dir / "replay_results.jsonl"
+    benchmark_metrics = await _run_dataset(
+        system=system,
+        rows=rows,
+        results_path=results_path,
+        prediction_source=cfg.benchmark.prediction_source,
+        approach="bao",
+    )
 
     summary = system.get_system_statistics()
     summary_path = output_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
+    write_json(summary_path, summary)
 
-    if labels:
-        benchmark_metrics = compute_metrics(
-            predictions=predictions,
-            labels=labels,
-            probabilities=probabilities,
-            costs=costs,
+    benchmark_path = output_dir / "benchmark_bao.json"
+    write_json(benchmark_path, benchmark_metrics)
+
+    if cfg.benchmark.write_manifest:
+        manifest = build_benchmark_manifest(
+            repo_root=REPO_ROOT,
+            dataset_path=Path(args.dataset).resolve(),
+            config_path=runtime_config_path,
             approach="bao",
+            agents_used=list(system.agent_sequence),
+            extra={
+                "prediction_source": cfg.benchmark.prediction_source,
+                "dataset_composition": dataset_composition(rows),
+                "summary": summary,
+            },
         )
-        benchmark_path = output_dir / "benchmark_bao.json"
-        benchmark_path.write_text(json.dumps(benchmark_metrics, indent=2))
-        print(f"Benchmark metrics: {benchmark_path}")
+        write_json(output_dir / "benchmark_bao_manifest.json", manifest)
 
+    print(f"Benchmark metrics: {benchmark_path}")
     print(f"Processed {summary['flows_processed']} flows")
     print(f"Replay output: {results_path}")
     print(f"Summary: {summary_path}")
+
+    if args.diagnostic_dataset:
+        diagnostic_rows = load_replay_dataset(args.diagnostic_dataset, max_rows=(args.max_flows or None))
+        if diagnostic_rows:
+            if cfg.benchmark.reset_state:
+                reset_sqlite_state(cfg.state.sqlite_path)
+            diagnostic_system = IntegratedBAOSystem(config_path=runtime_config_path)
+            diagnostic_results = output_dir / "replay_results_diagnostic.jsonl"
+            diagnostic_metrics = await _run_dataset(
+                system=diagnostic_system,
+                rows=diagnostic_rows,
+                results_path=diagnostic_results,
+                prediction_source=cfg.benchmark.prediction_source,
+                approach="bao_diagnostic",
+            )
+            write_json(output_dir / "benchmark_bao_diagnostic.json", diagnostic_metrics)
+            if cfg.benchmark.write_manifest:
+                diagnostic_manifest = build_benchmark_manifest(
+                    repo_root=REPO_ROOT,
+                    dataset_path=Path(args.diagnostic_dataset).resolve(),
+                    config_path=runtime_config_path,
+                    approach="bao_diagnostic",
+                    agents_used=list(diagnostic_system.agent_sequence),
+                    extra={
+                        "prediction_source": cfg.benchmark.prediction_source,
+                        "dataset_composition": dataset_composition(diagnostic_rows),
+                        "summary": diagnostic_system.get_system_statistics(),
+                    },
+                )
+                write_json(output_dir / "benchmark_bao_diagnostic_manifest.json", diagnostic_manifest)
+            print(f"Diagnostic benchmark: {output_dir / 'benchmark_bao_diagnostic.json'}")
 
 
 def main() -> None:

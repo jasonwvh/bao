@@ -2,18 +2,26 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import os
 import sys
+import time
+import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmark.metrics import compute_metrics
+from benchmark.runner import (
+    BenchmarkAccumulator,
+    build_benchmark_manifest,
+    dataset_composition,
+    write_json,
+)
+from orchestrator.config import PREDICTION_SOURCES
+from orchestrator.control.registry import load_registry, to_runtime_handles
 from orchestrator.data.replay import load_replay_dataset
+from orchestrator.data_plane.a2a_client import A2AClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("if_benchmark")
@@ -24,9 +32,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv", help="CSV or parquet dataset")
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
-    p.add_argument("--model-path", default=None, help="Path to model file")
-    p.add_argument("--cost", type=float, default=1.0, help="Cost per inference")
+    p.add_argument("--registry", default="config/agents.yaml", help="Path to A2A agent registry YAML")
+    p.add_argument("--cost", type=float, default=None, help="Override cost per inference")
+    p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default="probability")
+    p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
+
+
+def _build_payload(row: dict) -> dict:
+    return {
+        "request_id": str(uuid.uuid4()),
+        "flow_id": row["flow_id"],
+        "timestamp": row.get("timestamp") or time.time(),
+        "flow_features": row["flow_features"],
+        "context": {
+            "belief": {"p_mal": 0.5, "uncertainty": 0.69314718056},
+            "requested_capabilities": [],
+            "elicit_likelihood": True,
+            "seed": 7,
+        },
+    }
 
 
 def main() -> None:
@@ -35,55 +60,62 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = args.model_path
-    if model_path is None:
-        model_path = os.path.join(os.path.dirname(__file__), "models", "ocsvm.pkl")
+    registry = load_registry(args.registry)
+    handles = to_runtime_handles(registry)
+    handle = handles.get("ocsvm")
+    if handle is None:
+        raise RuntimeError("ocsvm not found or disabled in registry")
 
-    from agents.ocsvm.service import OCSVMAgent
+    a2a = A2AClient(retries=0)
+    health = a2a.health(handle)
+    if str(health.get("status", "")).lower() != "ok":
+        raise RuntimeError(f"ocsvm service unhealthy: {health}")
 
-    agent = OCSVMAgent(model_path=model_path, cost=args.cost)
+    per_call_cost = float(args.cost) if args.cost is not None else float(handle.cost)
 
     rows = load_replay_dataset(args.dataset, max_rows=(args.max_flows or None))
     if not rows:
         raise RuntimeError("No rows loaded from dataset")
 
-    predictions: list[int] = []
-    labels: list[int] = []
-    probabilities: list[float] = []
-    costs: list[float] = []
+    acc = BenchmarkAccumulator(prediction_source=args.prediction_source)
 
     for idx, row in enumerate(rows):
         true_label = row.get("true_label")
         if true_label is None:
             continue
 
-        output = agent.predict_with_uncertainty(row["flow_features"])
-        p_mal = float(output["proba"][1])
-        pred = 1 if p_mal >= 0.5 else 0
+        output = a2a.infer(handle, _build_payload(row))
+        p_mal = max(1e-6, min(1.0 - 1e-6, float((output.get("proba") or [0.5, 0.5])[1])))
 
-        labels.append(int(true_label))
-        probabilities.append(p_mal)
-        predictions.append(pred)
-        costs.append(agent.cost)
-
-        logger.info(
-            "[%d] flow_id=%s true=%d pred=%d p_mal=%.4f cost=%.2f",
-            idx + 1, row["flow_id"], int(true_label), pred, p_mal, agent.cost
+        acc.add_sample(
+            true_label=int(true_label),
+            probability=p_mal,
+            cost=per_call_cost,
+            label_hint=(output.get("prediction") or {}).get("label"),
         )
 
-    if not labels:
-        raise RuntimeError("No labeled rows found in dataset")
+        if (idx + 1) % 500 == 0:
+            logger.info("[%d/%d] flow_id=%s p_mal=%.4f", idx + 1, len(rows), row["flow_id"], p_mal)
 
-    metrics = compute_metrics(
-        predictions=predictions,
-        labels=labels,
-        probabilities=probabilities,
-        costs=costs,
-        approach="ocsvm",
-    )
+    metrics = acc.compute(approach="ocsvm")
 
     benchmark_path = output_dir / "benchmark_ocsvm.json"
-    benchmark_path.write_text(json.dumps(metrics, indent=2))
+    write_json(benchmark_path, metrics)
+
+    if args.write_manifest:
+        manifest = build_benchmark_manifest(
+            repo_root=REPO_ROOT,
+            dataset_path=Path(args.dataset).resolve(),
+            config_path=None,
+            approach="ocsvm",
+            agents_used=["ocsvm"],
+            extra={
+                "prediction_source": args.prediction_source,
+                "dataset_composition": dataset_composition(rows),
+                "registry_path": str(Path(args.registry).resolve()),
+            },
+        )
+        write_json(output_dir / "benchmark_ocsvm_manifest.json", manifest)
 
     print(f"Processed {metrics['flows_processed']} flows")
     print(f"Accuracy: {metrics['accuracy']:.4f}")
