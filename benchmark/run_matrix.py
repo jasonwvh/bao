@@ -8,11 +8,14 @@ import sys
 from pathlib import Path
 from typing import List
 
-from benchmark.metrics import compute_metrics
-from orchestrator.decision import DecisionCosts, realized_action_cost
-
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.metrics import compute_metrics
+from orchestrator.config import load_orchestrator_config
+from orchestrator.control.registry import load_registry, to_runtime_handles
+from orchestrator.decision import DecisionCosts, realized_action_cost
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +72,15 @@ def _agent_metrics_with_costs(replay_path: Path, *, per_call_cost: float, costs:
 
 def main() -> None:
     args = parse_args()
+    orch_cfg = load_orchestrator_config(args.config)
+    registry = load_registry(orch_cfg.orchestration.agent_registry_path)
+    handles = to_runtime_handles(registry)
+    agent_query_cost = {aid: float(handle.cost) for aid, handle in handles.items()}
+    base_decision_costs = DecisionCosts(
+        c_fn=float(orch_cfg.decision.c_fn),
+        c_fp=float(orch_cfg.decision.c_fp),
+        c_h=float(orch_cfg.decision.c_h),
+    )
     out_root = Path(args.output_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -84,6 +96,8 @@ def main() -> None:
             "agents/ocsvm/benchmark.py",
             "--dataset",
             args.dataset,
+            "--config",
+            args.config,
             "--output-dir",
             str(out_root / "ocsvm"),
             "--prediction-source",
@@ -98,6 +112,8 @@ def main() -> None:
             "agents/lstm_autoencoder/benchmark.py",
             "--dataset",
             args.dataset,
+            "--config",
+            args.config,
             "--output-dir",
             str(out_root / "lstm_autoencoder"),
             "--prediction-source",
@@ -112,6 +128,8 @@ def main() -> None:
             "agents/wgan_gp/benchmark.py",
             "--dataset",
             args.dataset,
+            "--config",
+            args.config,
             "--output-dir",
             str(out_root / "wgan_gp"),
             "--prediction-source",
@@ -131,6 +149,8 @@ def main() -> None:
                 str(out_root),
                 "--output-path",
                 str(profile_path),
+                "--config",
+                args.config,
             ]
         )
 
@@ -182,26 +202,26 @@ def main() -> None:
     if calibration_json is not None and calibration_json.exists():
         cal = _load_json(calibration_json)
         costs = DecisionCosts(
-            c_fn=float(cal.get("c_fn", 500.0)),
-            c_fp=float(cal.get("c_fp", 5.0)),
-            c_h=float(cal.get("c_h", 5000.0)),
+            c_fn=float(cal.get("c_fn", base_decision_costs.c_fn)),
+            c_fp=float(cal.get("c_fp", base_decision_costs.c_fp)),
+            c_h=float(cal.get("c_h", base_decision_costs.c_h)),
         )
         summary["costs_used_for_recalibration"] = {"c_fn": costs.c_fn, "c_fp": costs.c_fp, "c_h": costs.c_h}
         summary["ocsvm_recalibrated_costs"] = _agent_metrics_with_costs(
             out_root / "ocsvm" / "replay_results_ocsvm.json",
-            per_call_cost=1.0,
+            per_call_cost=float(agent_query_cost.get("ocsvm", 0.0)),
             costs=costs,
             approach="ocsvm_recalibrated",
         )
         summary["lstm_autoencoder_recalibrated_costs"] = _agent_metrics_with_costs(
             out_root / "lstm_autoencoder" / "replay_results_lstm_autoencoder.json",
-            per_call_cost=3.0,
+            per_call_cost=float(agent_query_cost.get("lstm_autoencoder", 0.0)),
             costs=costs,
             approach="lstm_autoencoder_recalibrated",
         )
         summary["wgan_gp_recalibrated_costs"] = _agent_metrics_with_costs(
             out_root / "wgan_gp" / "replay_results_wgan_gp.json",
-            per_call_cost=5.0,
+            per_call_cost=float(agent_query_cost.get("wgan_gp", 0.0)),
             costs=costs,
             approach="wgan_gp_recalibrated",
         )

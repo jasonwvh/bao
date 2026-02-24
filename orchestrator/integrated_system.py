@@ -428,14 +428,16 @@ class IntegratedBAOSystem:
             raise ValueError(f"unsupported query.policy={self.query_policy!r}")
 
         final_p = float(belief.get_compromise_prob())
-        decision, action_costs = select_expected_cost_action(final_p, self.decision_costs)
+        action_decision, action_costs = select_expected_cost_action(final_p, self.decision_costs)
+        classification_decision = "reject" if final_p >= 0.5 else "accept"
 
-        state["decision"] = decision
+        state["decision"] = classification_decision
+        state["action_decision"] = action_decision
         state["compromise_prob"] = final_p
         state["epistemic_uncertainty"] = float(belief.get_epistemic_uncertainty())
         state["confidence"] = max(final_p, 1.0 - final_p)
         state["decision_reasoning"].append(
-            f"decision={decision},cost_accept={action_costs['accept']:.6f},cost_reject={action_costs['reject']:.6f},cost_defer={action_costs['defer']:.6f}"
+            f"decision={classification_decision},action_decision={action_decision},cost_accept={action_costs['accept']:.6f},cost_reject={action_costs['reject']:.6f},cost_defer={action_costs['defer']:.6f}"
         )
 
         if true_label is not None:
@@ -465,7 +467,7 @@ class IntegratedBAOSystem:
 
         final_pred = 1 if final_p >= 0.5 else 0
         action_cost_value = realized_action_cost(
-            decision=decision,
+            decision=action_decision,
             prediction=final_pred,
             true_label=true_label,
             costs=self.decision_costs,
@@ -473,16 +475,17 @@ class IntegratedBAOSystem:
         self.metrics["total_action_cost"] += float(action_cost_value)
         self.metrics["total_utility_cost"] += float(action_cost_value) + float(state["cumulative_cost"])
 
-        if decision not in self.metrics["decisions"]:
-            self.metrics["decisions"][decision] = 0
-        self.metrics["decisions"][decision] += 1
-        if decision == "defer":
+        if classification_decision not in self.metrics["decisions"]:
+            self.metrics["decisions"][classification_decision] = 0
+        self.metrics["decisions"][classification_decision] += 1
+        if action_decision == "defer":
             self.metrics["hitl_count"] += 1
 
         event = {
             "flow_id": flow_id,
             "timestamp": timestamp,
-            "decision": decision,
+            "decision": classification_decision,
+            "action_decision": action_decision,
             "compromise_prob": state["compromise_prob"],
             "epistemic_uncertainty": state["epistemic_uncertainty"],
             "cumulative_cost": state["cumulative_cost"],

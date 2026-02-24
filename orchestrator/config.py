@@ -42,6 +42,12 @@ class FusionConfig:
 class CostCalibrationConfig:
     enabled: bool
     mode: str
+    c_fn_grid: list[float] = field(default_factory=list)
+    c_fp_grid: list[float] = field(default_factory=list)
+    c_h_grid: list[float] = field(default_factory=list)
+    min_expected_gain_grid: list[float] = field(default_factory=list)
+    max_agents_grid: list[int] = field(default_factory=list)
+    fusion_method: str = "handoff_latest"
 
 
 @dataclass(frozen=True)
@@ -171,6 +177,30 @@ def _as_list_of_str(value: Any) -> list[str]:
     return out
 
 
+def _as_list_of_float(value: Any) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    out: list[float] = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except Exception:
+            continue
+    return out
+
+
+def _as_list_of_int(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    out: list[int] = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except Exception:
+            continue
+    return out
+
+
 def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     cfg_path = Path(path).resolve()
     raw = yaml.safe_load(cfg_path.read_text()) or {}
@@ -253,8 +283,24 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     cost_cal_mode = str(cost_cal_raw.get("mode", "validation_derived")).strip().lower()
     if cost_cal_mode not in CALIBRATION_MODES:
         raise ValueError(f"unsupported decision.cost_calibration.mode={cost_cal_mode!r}")
+    cost_cal_fusion = str(cost_cal_raw.get("fusion_method", "handoff_latest")).strip().lower()
+    if cost_cal_fusion not in FUSION_METHODS:
+        raise ValueError(f"unsupported decision.cost_calibration.fusion_method={cost_cal_fusion!r}")
     accuracy_floor_delta = _to_float(decision_raw.get("accuracy_floor_delta", 0.01), 0.01)
     accuracy_floor_delta = max(0.0, min(1.0, accuracy_floor_delta))
+    decision_costs_raw = decision_raw.get("costs", {})
+    decision_costs = dict(decision_costs_raw) if isinstance(decision_costs_raw, Mapping) else {}
+    c_fn_raw = decision_costs.get("c_fn", legacy_costs.get("c_fn"))
+    c_fp_raw = decision_costs.get("c_fp", legacy_costs.get("c_fp"))
+    c_h_raw = decision_costs.get("c_h", legacy_costs.get("c_h"))
+    if c_fn_raw is None or c_fp_raw is None or c_h_raw is None:
+        raise ValueError("decision.costs.c_fn/c_fp/c_h are required in config")
+    try:
+        c_fn = float(c_fn_raw)
+        c_fp = float(c_fp_raw)
+        c_h = float(c_h_raw)
+    except Exception as exc:
+        raise ValueError("decision.costs.c_fn/c_fp/c_h must be numeric") from exc
 
     profile_value = routing_raw.get("profile_path")
     profile_path = _resolve_path(base_dir, profile_value, "") if profile_value else None
@@ -286,13 +332,19 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         fusion=FusionConfig(method=fusion_method, agent_weights=weights),
         decision=DecisionConfig(
             policy=str(decision_raw.get("policy", "expected_cost_min")).strip().lower(),
-            c_fn=_to_float(decision_raw.get("costs", {}).get("c_fn", legacy_costs.get("c_fn", 500.0)), 500.0),
-            c_fp=_to_float(decision_raw.get("costs", {}).get("c_fp", legacy_costs.get("c_fp", 5.0)), 5.0),
-            c_h=_to_float(decision_raw.get("costs", {}).get("c_h", legacy_costs.get("c_h", 5000.0)), 5000.0),
+            c_fn=c_fn,
+            c_fp=c_fp,
+            c_h=c_h,
             accuracy_floor_delta=accuracy_floor_delta,
             cost_calibration=CostCalibrationConfig(
                 enabled=_to_bool(cost_cal_raw.get("enabled", False), False),
                 mode=cost_cal_mode,
+                c_fn_grid=_as_list_of_float(cost_cal_raw.get("c_fn_grid", [])),
+                c_fp_grid=_as_list_of_float(cost_cal_raw.get("c_fp_grid", [])),
+                c_h_grid=_as_list_of_float(cost_cal_raw.get("c_h_grid", [])),
+                min_expected_gain_grid=_as_list_of_float(cost_cal_raw.get("min_expected_gain_grid", [])),
+                max_agents_grid=_as_list_of_int(cost_cal_raw.get("max_agents_grid", [])),
+                fusion_method=cost_cal_fusion,
             ),
         ),
         query=QueryConfig(

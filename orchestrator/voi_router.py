@@ -13,9 +13,9 @@ class VOIRouter:
         self,
         agents: Dict[str, Any],
         observation_models: Dict[str, Any],
-        c_fn: float = 500.0,  # Cost of false negative: letting hacker in ($1M)
-        c_fp: float = 5.0,       # Cost of false positive: blocking safe user ($50)
-        c_h: float = 5000.0,     # Cost of human deferral: expensive analyst time ($100k)
+        c_fn: float,
+        c_fp: float,
+        c_h: float,
         use_surrogate: bool = True,
         allow_exact: bool = True,
         capability_filter: Optional[Callable[[List[str], Dict[str, Any]], List[str]]] = None,

@@ -19,10 +19,11 @@ from benchmark.runner import (
     infer_prediction,
     write_json,
 )
-from orchestrator.config import PREDICTION_SOURCES
+from orchestrator.config import PREDICTION_SOURCES, load_orchestrator_config
 from orchestrator.control.registry import load_registry, to_runtime_handles
 from orchestrator.data.replay import load_replay_dataset
 from orchestrator.data_plane.a2a_client import A2AClient
+from orchestrator.decision import DecisionCosts
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +31,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv", help="CSV or parquet dataset")
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
-    p.add_argument("--registry", default="config/agents.yaml", help="Path to A2A agent registry YAML")
+    p.add_argument("--config", default="config/orchestrator_config.yaml", help="Path to orchestrator config YAML")
+    p.add_argument("--registry", default=None, help="Optional path to A2A agent registry YAML override")
     p.add_argument("--cost", type=float, default=None, help="Override cost per inference")
     p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default="probability")
     p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=True)
@@ -52,13 +54,26 @@ def _build_payload(row: dict) -> dict:
     }
 
 
+def _label_to_decision(label: object) -> str | None:
+    if label is None:
+        return None
+    x = str(label).strip().lower()
+    if x in {"malicious", "attack", "reject"}:
+        return "reject"
+    if x in {"benign", "clean", "accept"}:
+        return "accept"
+    return None
+
+
 def main() -> None:
     args = parse_args()
+    cfg = load_orchestrator_config(args.config)
+    registry_path = args.registry if args.registry else str(cfg.orchestration.agent_registry_path)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    registry = load_registry(args.registry)
+    registry = load_registry(registry_path)
     handles = to_runtime_handles(registry)
     handle = handles.get("wgan_gp")
     if handle is None:
@@ -75,7 +90,10 @@ def main() -> None:
     if not rows:
         raise RuntimeError("No rows loaded from dataset")
 
-    acc = BenchmarkAccumulator(prediction_source=args.prediction_source)
+    acc = BenchmarkAccumulator(
+        prediction_source=args.prediction_source,
+        decision_costs=DecisionCosts(c_fn=cfg.decision.c_fn, c_fp=cfg.decision.c_fp, c_h=cfg.decision.c_h),
+    )
     replay_rows = []
 
     for row in rows:
@@ -86,16 +104,21 @@ def main() -> None:
         output = a2a.infer(handle, _build_payload(row))
         p_mal = max(1e-6, min(1.0 - 1e-6, float((output.get("proba") or [0.5, 0.5])[1])))
 
+        label_hint = (output.get("prediction") or {}).get("label")
+        decision = _label_to_decision(label_hint)
         acc.add_sample(
             true_label=int(true_label),
             probability=p_mal,
             cost=per_call_cost,
-            label_hint=(output.get("prediction") or {}).get("label"),
+            decision=decision,
+            action_decision=decision,
+            label_hint=label_hint,
         )
         pred = infer_prediction(
             prediction_source=args.prediction_source,
             probability=p_mal,
-            label_hint=(output.get("prediction") or {}).get("label"),
+            decision=decision,
+            label_hint=label_hint,
         )
         replay_rows.append(
             {
@@ -127,7 +150,7 @@ def main() -> None:
             extra={
                 "prediction_source": args.prediction_source,
                 "dataset_composition": dataset_composition(rows),
-                "registry_path": str(Path(args.registry).resolve()),
+                "registry_path": str(Path(registry_path).resolve()),
             },
         )
         write_json(output_dir / "benchmark_wgan_gp_manifest.json", manifest)

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from benchmark.metrics import compute_metrics
-from orchestrator.config import file_sha256
+from orchestrator.config import file_sha256, load_orchestrator_config
 from orchestrator.decision import DecisionCosts, realized_action_cost, select_expected_cost_action
 
 
@@ -18,7 +18,11 @@ MODEL_PATH_BY_AGENT = {
     "wgan_gp": Path("agents/wgan_gp/models/wgan_gp.pt"),
 }
 
-DEFAULT_DECISION_COSTS = DecisionCosts(c_fn=25.0, c_fp=1.0, c_h=100.0)
+def load_default_decision_costs(config_path: Optional[str | Path] = None) -> DecisionCosts:
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg_path = Path(config_path).resolve() if config_path is not None else (repo_root / "config" / "orchestrator_config.yaml")
+    cfg = load_orchestrator_config(cfg_path)
+    return DecisionCosts(c_fn=float(cfg.decision.c_fn), c_fp=float(cfg.decision.c_fp), c_h=float(cfg.decision.c_h))
 
 
 @dataclass
@@ -29,7 +33,7 @@ class BenchmarkAccumulator:
     probabilities: List[float] = field(default_factory=list)
     query_costs: List[float] = field(default_factory=list)
     action_costs: List[float] = field(default_factory=list)
-    decision_costs: DecisionCosts = field(default_factory=lambda: DEFAULT_DECISION_COSTS)
+    decision_costs: DecisionCosts = field(default_factory=load_default_decision_costs)
 
     def add_sample(
         self,
@@ -38,6 +42,7 @@ class BenchmarkAccumulator:
         probability: float,
         cost: float,
         decision: Optional[str] = None,
+        action_decision: Optional[str] = None,
         label_hint: Optional[str] = None,
     ) -> None:
         p = float(probability)
@@ -49,7 +54,7 @@ class BenchmarkAccumulator:
             decision_costs=self.decision_costs,
         )
         action_cost = realized_action_cost(
-            decision=decision,
+            decision=action_decision if action_decision is not None else decision,
             prediction=pred,
             true_label=int(true_label),
             costs=self.decision_costs,
@@ -83,7 +88,7 @@ def infer_prediction(
 ) -> int:
     src = str(prediction_source).strip().lower()
     p = float(probability)
-    costs = decision_costs or DEFAULT_DECISION_COSTS
+    costs = decision_costs or load_default_decision_costs()
 
     if src == "decision":
         if decision is not None:

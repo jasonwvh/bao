@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -66,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diagnostic-dataset", default=None, help="Optional secondary replay dataset")
     p.add_argument("--reset-state", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument(
+        "--auto-recalibrate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Auto-generate calibrated BAO config/profile before running benchmark",
+    )
     return p.parse_args()
 
 
@@ -192,6 +199,7 @@ async def _run_dataset(
         compact = {
             "flow_id": row["flow_id"],
             "decision": res.get("decision"),
+            "action_decision": res.get("action_decision"),
             "compromise_prob": res.get("compromise_prob"),
             "epistemic_uncertainty": res.get("epistemic_uncertainty"),
             "cumulative_cost": res.get("cumulative_cost"),
@@ -209,9 +217,92 @@ async def _run_dataset(
             probability=float(res.get("compromise_prob", 0.5)),
             cost=float(res.get("cumulative_cost", 0.0)),
             decision=res.get("decision"),
+            action_decision=res.get("action_decision"),
         )
 
     return acc.compute(approach=approach)
+
+
+def _run_cmd(cmd: List[str]) -> None:
+    logging.getLogger("main").info("Running: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, cwd=str(REPO_ROOT))
+    if proc.returncode != 0:
+        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}")
+
+
+def _build_calibrated_config(
+    *,
+    dataset: str,
+    base_config_path: Path,
+    output_dir: Path,
+    prediction_source: str,
+    write_manifest: bool,
+    max_flows: int,
+) -> Path:
+    calibration_root = output_dir / "recalibration"
+    calibration_root.mkdir(parents=True, exist_ok=True)
+
+    max_flows_args: List[str] = []
+    if int(max_flows or 0) > 0:
+        max_flows_args = ["--max-flows", str(int(max_flows))]
+    manifest_flag = "--write-manifest" if bool(write_manifest) else "--no-write-manifest"
+
+    for aid, script in (
+        ("ocsvm", "agents/ocsvm/benchmark.py"),
+        ("lstm_autoencoder", "agents/lstm_autoencoder/benchmark.py"),
+        ("wgan_gp", "agents/wgan_gp/benchmark.py"),
+    ):
+        _run_cmd(
+            [
+                sys.executable,
+                script,
+                "--dataset",
+                dataset,
+                "--config",
+                str(base_config_path),
+                "--output-dir",
+                str(calibration_root / aid),
+                "--prediction-source",
+                prediction_source,
+                manifest_flag,
+                *max_flows_args,
+            ]
+        )
+
+    router_profile_path = output_dir / "router_profile.json"
+    _run_cmd(
+        [
+            sys.executable,
+            "benchmark/build_router_profile.py",
+            "--config",
+            str(base_config_path),
+            "--input-root",
+            str(calibration_root),
+            "--output-path",
+            str(router_profile_path),
+        ]
+    )
+
+    calibration_json = output_dir / "cost_calibration.json"
+    calibrated_cfg_path = output_dir / "effective_orchestrator_config_calibrated.yaml"
+    _run_cmd(
+        [
+            sys.executable,
+            "benchmark/calibrate_decision_costs.py",
+            "--base-config",
+            str(base_config_path),
+            "--input-root",
+            str(calibration_root),
+            "--profile-path",
+            str(router_profile_path),
+            "--output-json",
+            str(calibration_json),
+            "--output-config",
+            str(calibrated_cfg_path),
+        ]
+    )
+
+    return calibrated_cfg_path
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -227,6 +318,18 @@ async def _run(args: argparse.Namespace) -> None:
     runtime_config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
     cfg = load_orchestrator_config(runtime_config_path)
+    auto_recalibrate = bool(cfg.decision.cost_calibration.enabled) if args.auto_recalibrate is None else bool(args.auto_recalibrate)
+    if auto_recalibrate:
+        runtime_config_path = _build_calibrated_config(
+            dataset=args.dataset,
+            base_config_path=runtime_config_path,
+            output_dir=output_dir,
+            prediction_source=cfg.benchmark.prediction_source,
+            write_manifest=cfg.benchmark.write_manifest,
+            max_flows=int(args.max_flows or 0),
+        )
+        cfg = load_orchestrator_config(runtime_config_path)
+
     if cfg.benchmark.reset_state:
         reset_sqlite_state(cfg.state.sqlite_path)
 

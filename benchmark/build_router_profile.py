@@ -12,15 +12,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from orchestrator.config import file_sha256
+from orchestrator.config import file_sha256, load_orchestrator_config
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build adaptive-router profile from per-agent replay outputs")
+    p.add_argument("--config", default="config/orchestrator_config.yaml", help="Path to orchestrator config YAML")
     p.add_argument("--input-root", default="artifacts/replay/matrix", help="Root containing replay_results_<agent>.json files")
     p.add_argument("--output-path", default="artifacts/replay/router_profile.json", help="Output profile JSON")
-    p.add_argument("--agents", default="ocsvm,lstm_autoencoder,wgan_gp", help="Comma-separated agent ids")
-    p.add_argument("--bin-count", type=int, default=20, help="Probability bins per pairwise map")
+    p.add_argument("--agents", default=None, help="Comma-separated agent ids (defaults to orchestration.agent_sequence)")
+    p.add_argument("--bin-count", type=int, default=None, help="Probability bins (defaults to routing.bin_count)")
     return p.parse_args()
 
 
@@ -52,14 +53,18 @@ def _bin_index(p: float, bin_count: int) -> int:
 
 def main() -> None:
     args = parse_args()
+    cfg = load_orchestrator_config(args.config)
     input_root = Path(args.input_root).resolve()
     output_path = Path(args.output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    agents = [a.strip() for a in str(args.agents).split(",") if a.strip()]
+    if args.agents is None:
+        agents = list(cfg.orchestration.agent_sequence)
+    else:
+        agents = [a.strip() for a in str(args.agents).split(",") if a.strip()]
     if not agents:
         raise ValueError("at least one agent must be provided")
-    bin_count = max(2, int(args.bin_count))
+    bin_count = max(2, int(args.bin_count if args.bin_count is not None else cfg.routing.bin_count))
 
     replay_paths: Dict[str, Path] = {aid: _find_replay_file(input_root, aid) for aid in agents}
     rows_by_agent = {aid: _load_rows(path) for aid, path in replay_paths.items()}

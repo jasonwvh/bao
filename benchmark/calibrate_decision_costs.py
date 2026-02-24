@@ -15,6 +15,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orchestrator.decision import DecisionCosts, min_expected_action_cost, realized_action_cost
+from orchestrator.config import load_orchestrator_config
+from orchestrator.control.registry import load_registry, to_runtime_handles
 from orchestrator.router import AdaptiveRouter
 from orchestrator.types import AgentRuntimeHandle
 
@@ -26,10 +28,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-config", default="config/orchestrator_config.yaml", help="Base orchestrator config")
     p.add_argument("--output-json", default="artifacts/replay/cost_calibration.json", help="Calibration summary output")
     p.add_argument("--output-config", default="artifacts/replay/orchestrator_calibrated.yaml", help="Calibrated config output")
-    p.add_argument("--agents", default="ocsvm,lstm_autoencoder,wgan_gp", help="Comma-separated agent sequence")
-    p.add_argument("--first-agent", default="ocsvm", help="First queried agent")
-    p.add_argument("--max-agents", type=int, default=3, help="Max agents queried per flow")
-    p.add_argument("--min-expected-gain", type=float, default=0.0, help="Adaptive router gain threshold")
+    p.add_argument("--agents", default=None, help="Comma-separated agent sequence (defaults to config)")
+    p.add_argument("--first-agent", default=None, help="First queried agent (defaults to query.first_agent)")
+    p.add_argument("--max-agents", type=int, default=None, help="Max agents queried per flow (defaults to config)")
+    p.add_argument("--min-expected-gain", type=float, default=None, help="Adaptive router gain threshold (defaults to config)")
     p.add_argument(
         "--max-agents-grid",
         default=None,
@@ -37,19 +39,37 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--min-expected-gain-grid",
-        default="0.0,-0.5,-1.0,-2.0,-3.0,-5.0,-10.0",
-        help="Comma-separated min_expected_gain candidates",
+        default=None,
+        help="Comma-separated min_expected_gain candidates (defaults to config cost_calibration)",
     )
-    p.add_argument("--fusion-method", choices=["handoff_latest", "utility_select"], default="handoff_latest")
-    p.add_argument("--accuracy-floor-delta", type=float, default=0.01, help="Allowed drop vs strongest single agent")
-    p.add_argument("--c-fn-grid", default="25,50,100,200,500", help="Grid values for c_fn")
-    p.add_argument("--c-fp-grid", default="1,2,5,10", help="Grid values for c_fp")
-    p.add_argument("--c-h-grid", default="100,500,1000,5000", help="Grid values for c_h")
+    p.add_argument("--fusion-method", choices=["handoff_latest", "utility_select"], default=None)
+    p.add_argument("--accuracy-floor-delta", type=float, default=None, help="Allowed drop vs strongest single agent")
+    p.add_argument("--c-fn-grid", default=None, help="Grid values for c_fn (comma-separated)")
+    p.add_argument("--c-fp-grid", default=None, help="Grid values for c_fp (comma-separated)")
+    p.add_argument("--c-h-grid", default=None, help="Grid values for c_h (comma-separated)")
     return p.parse_args()
 
 
 def _parse_grid(spec: str) -> List[float]:
     return [float(x.strip()) for x in str(spec).split(",") if x.strip()]
+
+
+def _list_or_default_float(cli_spec: str | None, cfg_values: List[float], fallback: List[float]) -> List[float]:
+    if cli_spec not in (None, ""):
+        vals = _parse_grid(str(cli_spec))
+        return vals if vals else list(fallback)
+    if cfg_values:
+        return [float(x) for x in cfg_values]
+    return list(fallback)
+
+
+def _list_or_default_int(cli_spec: str | None, cfg_values: List[int], fallback: List[int]) -> List[int]:
+    if cli_spec not in (None, ""):
+        vals = [int(x.strip()) for x in str(cli_spec).split(",") if x.strip()]
+        return vals if vals else list(fallback)
+    if cfg_values:
+        return [int(x) for x in cfg_values]
+    return list(fallback)
 
 
 def _find_replay_file(root: Path, agent_id: str) -> Path:
@@ -208,18 +228,43 @@ def main() -> None:
     input_root = Path(args.input_root).resolve()
     profile_path = Path(args.profile_path).resolve()
     base_config_path = Path(args.base_config).resolve()
+    cfg_model = load_orchestrator_config(base_config_path)
     output_json = Path(args.output_json).resolve()
     output_cfg = Path(args.output_config).resolve()
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_cfg.parent.mkdir(parents=True, exist_ok=True)
 
-    sequence = [a.strip() for a in str(args.agents).split(",") if a.strip()]
-    first_agent = str(args.first_agent).strip()
+    registry = load_registry(cfg_model.orchestration.agent_registry_path)
+    handles = to_runtime_handles(registry)
+
+    if args.agents in (None, ""):
+        sequence = list(cfg_model.orchestration.agent_sequence) or list(handles.keys())
+    else:
+        sequence = [a.strip() for a in str(args.agents).split(",") if a.strip()]
+
+    first_agent = str(args.first_agent if args.first_agent is not None else (cfg_model.query.first_agent or sequence[0])).strip()
     if first_agent not in sequence:
         sequence = [first_agent] + sequence
 
+    max_agents_default = int(args.max_agents) if args.max_agents is not None else int(cfg_model.query.max_agents)
+    min_expected_gain_default = (
+        float(args.min_expected_gain) if args.min_expected_gain is not None else float(cfg_model.query.min_expected_gain)
+    )
+    fusion_method = str(
+        args.fusion_method
+        if args.fusion_method is not None
+        else (cfg_model.decision.cost_calibration.fusion_method or cfg_model.fusion.method)
+    ).strip().lower()
+    accuracy_floor_delta = (
+        float(args.accuracy_floor_delta)
+        if args.accuracy_floor_delta is not None
+        else float(cfg_model.decision.accuracy_floor_delta)
+    )
+
     rows_by_agent: Dict[str, Dict[str, Dict]] = {}
-    agent_costs: Dict[str, float] = {"ocsvm": 1.0, "lstm_autoencoder": 3.0, "wgan_gp": 5.0}
+    agent_costs: Dict[str, float] = {aid: float(handle.cost) for aid, handle in handles.items()}
+    for aid in sequence:
+        agent_costs.setdefault(aid, 0.0)
     reliability: Dict[str, float] = {}
 
     for aid in sequence:
@@ -242,20 +287,38 @@ def main() -> None:
         for aid in sequence
     }
     strongest_single = max(single_acc.values())
-    floor = strongest_single - float(args.accuracy_floor_delta)
+    floor = strongest_single - accuracy_floor_delta
 
-    fn_grid = _parse_grid(args.c_fn_grid)
-    fp_grid = _parse_grid(args.c_fp_grid)
-    h_grid = _parse_grid(args.c_h_grid)
-
-    max_agents_grid = (
-        [max(1, int(args.max_agents))]
-        if args.max_agents_grid in (None, "")
-        else [max(1, int(x.strip())) for x in str(args.max_agents_grid).split(",") if x.strip()]
+    fn_grid = _list_or_default_float(
+        args.c_fn_grid,
+        cfg_model.decision.cost_calibration.c_fn_grid,
+        [float(cfg_model.decision.c_fn)],
     )
-    min_gain_grid = [float(x.strip()) for x in str(args.min_expected_gain_grid).split(",") if x.strip()]
-    if float(args.min_expected_gain) not in min_gain_grid:
-        min_gain_grid.append(float(args.min_expected_gain))
+    fp_grid = _list_or_default_float(
+        args.c_fp_grid,
+        cfg_model.decision.cost_calibration.c_fp_grid,
+        [float(cfg_model.decision.c_fp)],
+    )
+    h_grid = _list_or_default_float(
+        args.c_h_grid,
+        cfg_model.decision.cost_calibration.c_h_grid,
+        [float(cfg_model.decision.c_h)],
+    )
+
+    max_agents_grid = _list_or_default_int(
+        args.max_agents_grid,
+        cfg_model.decision.cost_calibration.max_agents_grid,
+        [max_agents_default],
+    )
+    max_agents_grid = [max(1, int(v)) for v in max_agents_grid]
+
+    min_gain_grid = _list_or_default_float(
+        args.min_expected_gain_grid,
+        cfg_model.decision.cost_calibration.min_expected_gain_grid,
+        [min_expected_gain_default],
+    )
+    if min_expected_gain_default not in min_gain_grid:
+        min_gain_grid.append(min_expected_gain_default)
 
     candidates: List[Candidate] = []
     for c_fn in fn_grid:
@@ -270,7 +333,7 @@ def main() -> None:
                             first_agent=first_agent,
                             max_agents=max_agents,
                             min_expected_gain=min_gain,
-                            fusion_method=str(args.fusion_method),
+                            fusion_method=fusion_method,
                             rows_by_agent=rows_by_agent,
                             common_flow_ids=common,
                             agent_costs=agent_costs,
@@ -321,8 +384,12 @@ def main() -> None:
     base_dir = base_config_path.parent
     decision = dict(cfg.get("decision", {}) or {})
     decision["costs"] = {"c_fn": best_costs.c_fn, "c_fp": best_costs.c_fp, "c_h": best_costs.c_h}
-    decision["accuracy_floor_delta"] = float(args.accuracy_floor_delta)
-    decision["cost_calibration"] = {"enabled": True, "mode": "validation_derived"}
+    decision["accuracy_floor_delta"] = float(accuracy_floor_delta)
+    cost_cal = dict(decision.get("cost_calibration", {}) or {})
+    cost_cal["enabled"] = True
+    cost_cal["mode"] = "validation_derived"
+    cost_cal["fusion_method"] = fusion_method
+    decision["cost_calibration"] = cost_cal
     cfg["decision"] = decision
 
     query = dict(cfg.get("query", {}) or {})
@@ -333,7 +400,7 @@ def main() -> None:
     cfg["query"] = query
 
     fusion = dict(cfg.get("fusion", {}) or {})
-    fusion["method"] = str(args.fusion_method)
+    fusion["method"] = fusion_method
     cfg["fusion"] = fusion
 
     routing = dict(cfg.get("routing", {}) or {})
