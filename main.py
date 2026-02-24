@@ -23,8 +23,9 @@ from benchmark.runner import (
     reset_sqlite_state,
     write_json,
 )
-from orchestrator.config import PREDICTION_SOURCES, load_orchestrator_config
+from orchestrator.config import FUSION_METHODS, PREDICTION_SOURCES, QUERY_POLICIES, load_orchestrator_config
 from orchestrator.data.replay import load_replay_dataset
+from orchestrator.decision import DecisionCosts
 from orchestrator.integrated_system import IntegratedBAOSystem
 
 
@@ -44,17 +45,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
     p.add_argument("--seed", type=int, default=7, help="Seed")
     p.add_argument("--max-agents", type=int, default=None, help="Override query.max_agents")
+    p.add_argument("--query-policy", choices=sorted(QUERY_POLICIES), default=None, help="Override query.policy")
+    p.add_argument("--first-agent", default=None, help="Override query.first_agent")
+    p.add_argument("--min-expected-gain", type=float, default=None, help="Override query.min_expected_gain")
     p.add_argument(
         "--agent-sequence",
         default=None,
         help="Comma-separated agent sequence override (e.g. lstm_autoencoder,ocsvm)",
     )
+    p.add_argument("--fusion-method", choices=sorted(FUSION_METHODS), default=None, help="Override fusion.method")
+    p.add_argument("--router-profile", default=None, help="Override routing.profile_path")
     p.add_argument(
         "--update-mode",
         choices=["posterior_first", "likelihood_strict"],
         default=None,
         help="Override orchestration update mode",
     )
+    p.add_argument("--cost-calibration-json", default=None, help="Optional JSON with calibrated c_fn/c_fp/c_h")
     p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default=None)
     p.add_argument("--diagnostic-dataset", default=None, help="Optional secondary replay dataset")
     p.add_argument("--reset-state", action=argparse.BooleanOptionalAction, default=None)
@@ -73,6 +80,24 @@ def _apply_overrides(raw_config: Dict[str, Any], args: argparse.Namespace) -> Di
         orch["agent_sequence"] = [x.strip() for x in str(args.agent_sequence).split(",") if x.strip()]
     cfg["orchestration"] = orch
 
+    fusion = dict(cfg.get("fusion", {}) or {})
+    if args.fusion_method is not None:
+        fusion["method"] = str(args.fusion_method)
+    cfg["fusion"] = fusion
+
+    decision = dict(cfg.get("decision", {}) or {})
+    if args.cost_calibration_json is not None:
+        payload = json.loads(Path(args.cost_calibration_json).read_text())
+        costs = dict(decision.get("costs", {}) or {})
+        if "c_fn" in payload:
+            costs["c_fn"] = float(payload["c_fn"])
+        if "c_fp" in payload:
+            costs["c_fp"] = float(payload["c_fp"])
+        if "c_h" in payload:
+            costs["c_h"] = float(payload["c_h"])
+        decision["costs"] = costs
+    cfg["decision"] = decision
+
     benchmark = dict(cfg.get("benchmark", {}) or {})
     if args.prediction_source is not None:
         benchmark["prediction_source"] = str(args.prediction_source)
@@ -85,7 +110,18 @@ def _apply_overrides(raw_config: Dict[str, Any], args: argparse.Namespace) -> Di
     query = dict(cfg.get("query", {}) or {})
     if args.max_agents is not None:
         query["max_agents"] = int(args.max_agents)
+    if args.query_policy is not None:
+        query["policy"] = str(args.query_policy)
+    if args.first_agent is not None:
+        query["first_agent"] = str(args.first_agent)
+    if args.min_expected_gain is not None:
+        query["min_expected_gain"] = float(args.min_expected_gain)
     cfg["query"] = query
+
+    routing = dict(cfg.get("routing", {}) or {})
+    if args.router_profile is not None:
+        routing["profile_path"] = str(args.router_profile)
+    cfg["routing"] = routing
 
     return cfg
 
@@ -121,6 +157,13 @@ def _absolutize_config_paths(config: Dict[str, Any], base_dir: Path) -> Dict[str
             pre["schema_path"] = str((base_dir / p).resolve())
     cfg["preprocessing"] = pre
 
+    routing = dict(cfg.get("routing", {}) or {})
+    if "profile_path" in routing and routing["profile_path"] not in (None, ""):
+        p = Path(str(routing["profile_path"]))
+        if not p.is_absolute():
+            routing["profile_path"] = str((base_dir / p).resolve())
+    cfg["routing"] = routing
+
     return cfg
 
 
@@ -130,12 +173,13 @@ async def _run_dataset(
     rows: List[Dict[str, Any]],
     results_path: Path,
     prediction_source: str,
+    decision_costs: DecisionCosts,
     approach: str,
 ) -> Dict[str, Any]:
     if results_path.exists():
         results_path.unlink()
 
-    acc = BenchmarkAccumulator(prediction_source=prediction_source)
+    acc = BenchmarkAccumulator(prediction_source=prediction_source, decision_costs=decision_costs)
 
     for row in rows:
         res = await system.process_flow(
@@ -198,6 +242,7 @@ async def _run(args: argparse.Namespace) -> None:
         rows=rows,
         results_path=results_path,
         prediction_source=cfg.benchmark.prediction_source,
+        decision_costs=DecisionCosts(c_fn=cfg.decision.c_fn, c_fp=cfg.decision.c_fp, c_h=cfg.decision.c_h),
         approach="bao",
     )
 
@@ -240,6 +285,7 @@ async def _run(args: argparse.Namespace) -> None:
                 rows=diagnostic_rows,
                 results_path=diagnostic_results,
                 prediction_source=cfg.benchmark.prediction_source,
+                decision_costs=DecisionCosts(c_fn=cfg.decision.c_fn, c_fp=cfg.decision.c_fp, c_h=cfg.decision.c_h),
                 approach="bao_diagnostic",
             )
             write_json(output_dir / "benchmark_bao_diagnostic.json", diagnostic_metrics)

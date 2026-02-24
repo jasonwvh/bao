@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from orchestrator.belief_state import BeliefStateManager
 from orchestrator.config import OrchestratorConfig, load_orchestrator_config
@@ -13,14 +13,21 @@ from orchestrator.control.registry import load_registry, to_runtime_handles
 from orchestrator.control.scheduler import filter_by_capability
 from orchestrator.data_plane.a2a_client import A2AClient, A2AClientError
 from orchestrator.data_plane.state_sqlite import SQLiteStateBackend
-from orchestrator.decision import DecisionCosts, approximate_voi, select_expected_cost_action
+from orchestrator.decision import (
+    DecisionCosts,
+    approximate_voi,
+    min_expected_action_cost,
+    realized_action_cost,
+    select_expected_cost_action,
+)
 from orchestrator.preprocessing import OrchestratorPreprocessor
+from orchestrator.router import AdaptiveRouter
 
 logger = logging.getLogger("orchestrator")
 
 
 class IntegratedBAOSystem:
-    """Deterministic BAO runtime with posterior-first fusion and VOI gating."""
+    """Deterministic BAO runtime with config-driven query policy and fusion."""
 
     def __init__(self, config_path: str | Path):
         self.config_obj: OrchestratorConfig = load_orchestrator_config(config_path)
@@ -53,8 +60,6 @@ class IntegratedBAOSystem:
         self.metrics_output_path = self.config_obj.logging.jsonl_path
         self.metrics_output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if self.config_obj.fusion.method != "logit_pool":
-            raise ValueError(f"unsupported fusion.method={self.config_obj.fusion.method!r}")
         if self.config_obj.decision.policy != "expected_cost_min":
             raise ValueError(f"unsupported decision.policy={self.config_obj.decision.policy!r}")
 
@@ -64,11 +69,24 @@ class IntegratedBAOSystem:
             c_h=float(self.config_obj.decision.c_h),
         )
 
+        self.query_policy = self.config_obj.query.policy
+        self.fusion_method = self.config_obj.fusion.method
+        self.router: Optional[AdaptiveRouter] = None
+        if self.query_policy == "adaptive_router":
+            self.router = AdaptiveRouter(
+                decision_costs=self.decision_costs,
+                profile_path=self.config_obj.routing.profile_path,
+                min_samples_per_bin=int(self.config_obj.routing.min_samples_per_bin),
+            )
+
         self.metrics = {
             "flows_processed": 0,
             "decisions": {"accept": 0, "reject": 0, "defer": 0},
             "agent_calls": {aid: 0 for aid in self.agent_sequence},
-            "total_cost": 0.0,
+            "total_cost": 0.0,  # Backward-compatible alias for query cost.
+            "total_query_cost": 0.0,
+            "total_action_cost": 0.0,
+            "total_utility_cost": 0.0,
             "hitl_count": 0,
         }
 
@@ -111,10 +129,19 @@ class IntegratedBAOSystem:
     def _candidate_agents(self, flow_features: Dict[str, Any]) -> List[str]:
         required_caps = list(flow_features.get("required_capabilities", []))
         candidates = filter_by_capability(self.agent_sequence, self.agent_handles, required_caps)
+        first_agent = self.config_obj.query.first_agent
+        if first_agent is not None and first_agent in candidates:
+            candidates = [first_agent] + [aid for aid in candidates if aid != first_agent]
         max_agents = min(int(self.config_obj.query.max_agents), len(candidates))
         return candidates[:max_agents]
 
-    def _query_decision(
+    def _ordered_candidates(self, candidates: List[str]) -> List[str]:
+        first_agent = self.config_obj.query.first_agent
+        if first_agent is None or first_agent not in candidates:
+            return candidates
+        return [first_agent] + [aid for aid in candidates if aid != first_agent]
+
+    def _query_decision_strict(
         self,
         p_mal: float,
         uncertainty: float,
@@ -154,6 +181,113 @@ class IntegratedBAOSystem:
         eps = self.config_obj.belief.eps
         return max(eps, min(1.0 - eps, p))
 
+    def _apply_fusion_update(
+        self,
+        *,
+        belief: Any,
+        agent_output: Dict[str, Any],
+        agent_id: str,
+        p_agent: float,
+        queried_probabilities: Dict[str, float],
+    ) -> Tuple[Dict[str, float], str]:
+        if self.fusion_method == "logit_pool":
+            weight = self._agent_weight(agent_id)
+            updated = belief.update_from_agent_output(
+                agent_output=agent_output,
+                agent_id=agent_id,
+                update_mode=self.config_obj.orchestration.update_mode,
+                weight=weight,
+                eps=self.config_obj.belief.eps,
+                likelihood_sanity_gate=self.config_obj.belief.likelihood_sanity_gate,
+            )
+            return updated, "logit_pool"
+
+        if self.fusion_method == "handoff_latest":
+            weight = self._agent_weight(agent_id)
+            belief.set_compromise_prob(p_agent)
+            belief.var = max(1e-4, min(4.0, 1.0 / max(weight, self.config_obj.belief.eps)))
+            return {
+                "mu": belief.mu,
+                "var": belief.get_variance(),
+                "compromise_prob": belief.get_compromise_prob(),
+                "epistemic_uncertainty": belief.get_epistemic_uncertainty(),
+            }, "handoff_latest"
+
+        # utility_select
+        queried_probabilities[agent_id] = p_agent
+        best_agent = agent_id
+        best_proxy = float("inf")
+        best_prob = p_agent
+        for aid, p in queried_probabilities.items():
+            reliability = max(self.config_obj.belief.eps, float(self.belief_manager.get_global_reliability(aid)))
+            proxy_cost = min_expected_action_cost(p, self.decision_costs) / reliability
+            if proxy_cost < best_proxy:
+                best_proxy = proxy_cost
+                best_agent = aid
+                best_prob = p
+
+        belief.set_compromise_prob(best_prob)
+        belief.var = max(1e-4, min(4.0, 1.0 / max(self._agent_weight(best_agent), self.config_obj.belief.eps)))
+        return {
+            "mu": belief.mu,
+            "var": belief.get_variance(),
+            "compromise_prob": belief.get_compromise_prob(),
+            "epistemic_uncertainty": belief.get_epistemic_uncertainty(),
+        }, f"utility_select:{best_agent}"
+
+    def _query_single_agent(
+        self,
+        *,
+        aid: str,
+        belief: Any,
+        features: Dict[str, Any],
+        flow_id: str,
+        timestamp: float,
+        state: Dict[str, Any],
+        queried_probabilities: Dict[str, float],
+    ) -> bool:
+        handle = self.agent_handles[aid]
+        payload = self._build_payload(
+            flow_id=flow_id,
+            timestamp=timestamp,
+            flow_features=features,
+            p_mal=belief.get_compromise_prob(),
+            uncertainty=belief.get_epistemic_uncertainty(),
+        )
+
+        try:
+            output = self.a2a.infer(handle, payload)
+        except A2AClientError as exc:
+            state["decision_reasoning"].append(f"agent_failed={aid}:{exc}")
+            return False
+
+        p_agent = self._clip_probability((output.get("proba") or [0.5, 0.5])[1])
+        output["proba"] = [1.0 - p_agent, p_agent]
+
+        updated, fusion_note = self._apply_fusion_update(
+            belief=belief,
+            agent_output=output,
+            agent_id=aid,
+            p_agent=p_agent,
+            queried_probabilities=queried_probabilities,
+        )
+
+        state["agents_queried"].append(aid)
+        state["agent_outputs"].append(output)
+        state["iteration"] += 1
+        state["cumulative_cost"] += float(handle.cost)
+        state["belief_mu"] = float(updated["mu"])
+        state["belief_var"] = float(updated["var"])
+        state["compromise_prob"] = float(updated["compromise_prob"])
+        state["epistemic_uncertainty"] = float(updated["epistemic_uncertainty"])
+        state["confidence"] = max(state["compromise_prob"], 1.0 - state["compromise_prob"])
+
+        self.metrics["agent_calls"][aid] = self.metrics["agent_calls"].get(aid, 0) + 1
+        state["decision_reasoning"].append(
+            f"agent={aid},p_agent={p_agent:.6f},p_post={state['compromise_prob']:.6f},h={state['epistemic_uncertainty']:.6f},fusion={fusion_note}"
+        )
+        return True
+
     async def process_flow(
         self,
         flow_features: Dict[str, Any],
@@ -162,11 +296,9 @@ class IntegratedBAOSystem:
         true_label: Optional[int] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        # Do not inject shared pp_* fields globally: each agent owns its own preprocessing.
-        # Shared preprocessing can distort other agents when schemas differ.
         features = dict(flow_features)
 
-        candidates = self._candidate_agents(features)
+        candidates = self._ordered_candidates(self._candidate_agents(features))
         belief = self.belief_manager.get_or_create_belief(
             flow_id=flow_id,
             prior_attack_rate=self.config_obj.belief.prior_attack_rate,
@@ -182,6 +314,7 @@ class IntegratedBAOSystem:
             "agent_outputs": [],
             "decision_reasoning": [],
             "voi_scores": {},
+            "expected_gain_scores": {},
             "cumulative_cost": 0.0,
             "iteration": 0,
             "max_iterations": len(candidates),
@@ -198,67 +331,101 @@ class IntegratedBAOSystem:
             "total_time_ms": 0.0,
             "confidence": max(belief.get_compromise_prob(), 1.0 - belief.get_compromise_prob()),
             "decision": None,
+            "query_policy": self.query_policy,
+            "fusion_method": self.fusion_method,
         }
 
-        for idx, aid in enumerate(candidates):
-            handle = self.agent_handles[aid]
-            payload = self._build_payload(
-                flow_id=flow_id,
-                timestamp=timestamp,
-                flow_features=features,
-                p_mal=belief.get_compromise_prob(),
-                uncertainty=belief.get_epistemic_uncertainty(),
-            )
+        queried_probabilities: Dict[str, float] = {}
 
-            try:
-                output = self.a2a.infer(handle, payload)
-            except A2AClientError as exc:
-                state["decision_reasoning"].append(f"agent_failed={aid}:{exc}")
-                continue
-
-            p_agent = self._clip_probability((output.get("proba") or [0.5, 0.5])[1])
-            output["proba"] = [1.0 - p_agent, p_agent]
-
-            weight = self._agent_weight(aid)
-            updated = belief.update_from_agent_output(
-                agent_output=output,
-                agent_id=aid,
-                update_mode=self.config_obj.orchestration.update_mode,
-                weight=weight,
-                eps=self.config_obj.belief.eps,
-                likelihood_sanity_gate=self.config_obj.belief.likelihood_sanity_gate,
-            )
-
-            state["agents_queried"].append(aid)
-            state["agent_outputs"].append(output)
-            state["iteration"] += 1
-            state["cumulative_cost"] += float(handle.cost)
-            state["belief_mu"] = float(updated["mu"])
-            state["belief_var"] = float(updated["var"])
-            state["compromise_prob"] = float(updated["compromise_prob"])
-            state["epistemic_uncertainty"] = float(updated["epistemic_uncertainty"])
-            state["confidence"] = max(state["compromise_prob"], 1.0 - state["compromise_prob"])
-
-            self.metrics["agent_calls"][aid] = self.metrics["agent_calls"].get(aid, 0) + 1
-            state["decision_reasoning"].append(
-                f"agent={aid},p_agent={p_agent:.6f},p_post={state['compromise_prob']:.6f},h={state['epistemic_uncertainty']:.6f}"
-            )
-
-            if idx + 1 >= len(candidates):
-                break
-
-            next_agent = candidates[idx + 1]
-            should_query, voi_value = self._query_decision(
-                p_mal=state["compromise_prob"],
-                uncertainty=state["epistemic_uncertainty"],
-                next_agent_cost=float(self.agent_handles[next_agent].cost),
-            )
-            state["voi_scores"][next_agent] = float(voi_value)
-            if not should_query:
-                state["decision_reasoning"].append(
-                    f"stop_after={aid},voi={voi_value:.6f},next_cost={float(self.agent_handles[next_agent].cost):.6f}"
+        if self.query_policy == "strict_cascade":
+            for idx, aid in enumerate(candidates):
+                ok = self._query_single_agent(
+                    aid=aid,
+                    belief=belief,
+                    features=features,
+                    flow_id=flow_id,
+                    timestamp=timestamp,
+                    state=state,
+                    queried_probabilities=queried_probabilities,
                 )
-                break
+                if not ok:
+                    continue
+
+                if idx + 1 >= len(candidates):
+                    break
+
+                next_agent = candidates[idx + 1]
+                should_query, voi_value = self._query_decision_strict(
+                    p_mal=state["compromise_prob"],
+                    uncertainty=state["epistemic_uncertainty"],
+                    next_agent_cost=float(self.agent_handles[next_agent].cost),
+                )
+                state["voi_scores"][next_agent] = float(voi_value)
+                if not should_query:
+                    state["decision_reasoning"].append(
+                        f"stop_after={aid},voi={voi_value:.6f},next_cost={float(self.agent_handles[next_agent].cost):.6f}"
+                    )
+                    break
+
+        elif self.query_policy == "adaptive_router":
+            if candidates:
+                first_agent = candidates[0]
+                first_ok = self._query_single_agent(
+                    aid=first_agent,
+                    belief=belief,
+                    features=features,
+                    flow_id=flow_id,
+                    timestamp=timestamp,
+                    state=state,
+                    queried_probabilities=queried_probabilities,
+                )
+                last_agent = first_agent
+
+                if not first_ok:
+                    state["decision_reasoning"].append("adaptive_router:first_agent_failed")
+
+                while self.router is not None and len(state["agents_queried"]) < len(candidates):
+                    queried = set(state["agents_queried"])
+                    remaining = [aid for aid in candidates if aid not in queried]
+                    if not remaining:
+                        break
+
+                    source_agent = state["agents_queried"][-1] if state["agents_queried"] else last_agent
+                    next_agent, scores = self.router.select_next_agent(
+                        current_probability=float(state["compromise_prob"]),
+                        source_agent=source_agent,
+                        candidate_agents=remaining,
+                        agent_handles=self.agent_handles,
+                        belief_manager=self.belief_manager,
+                        min_expected_gain=float(self.config_obj.query.min_expected_gain),
+                    )
+                    state["expected_gain_scores"][source_agent] = {
+                        aid: score.to_dict() for aid, score in scores.items()
+                    }
+                    # Keep compatibility key for external consumers.
+                    state["voi_scores"].update({aid: float(score.expected_gain) for aid, score in scores.items()})
+
+                    if next_agent is None:
+                        state["decision_reasoning"].append(
+                            f"adaptive_stop_after={source_agent},min_expected_gain={float(self.config_obj.query.min_expected_gain):.6f}"
+                        )
+                        break
+
+                    ok = self._query_single_agent(
+                        aid=next_agent,
+                        belief=belief,
+                        features=features,
+                        flow_id=flow_id,
+                        timestamp=timestamp,
+                        state=state,
+                        queried_probabilities=queried_probabilities,
+                    )
+                    if not ok:
+                        state["decision_reasoning"].append(f"adaptive_skip_failed={next_agent}")
+                        continue
+
+        else:
+            raise ValueError(f"unsupported query.policy={self.query_policy!r}")
 
         final_p = float(belief.get_compromise_prob())
         decision, action_costs = select_expected_cost_action(final_p, self.decision_costs)
@@ -294,6 +461,18 @@ class IntegratedBAOSystem:
 
         self.metrics["flows_processed"] += 1
         self.metrics["total_cost"] += float(state["cumulative_cost"])
+        self.metrics["total_query_cost"] += float(state["cumulative_cost"])
+
+        final_pred = 1 if final_p >= 0.5 else 0
+        action_cost_value = realized_action_cost(
+            decision=decision,
+            prediction=final_pred,
+            true_label=true_label,
+            costs=self.decision_costs,
+        )
+        self.metrics["total_action_cost"] += float(action_cost_value)
+        self.metrics["total_utility_cost"] += float(action_cost_value) + float(state["cumulative_cost"])
+
         if decision not in self.metrics["decisions"]:
             self.metrics["decisions"][decision] = 0
         self.metrics["decisions"][decision] += 1
@@ -309,7 +488,10 @@ class IntegratedBAOSystem:
             "cumulative_cost": state["cumulative_cost"],
             "agents_queried": state["agents_queried"],
             "voi_scores": state["voi_scores"],
+            "expected_gain_scores": state["expected_gain_scores"],
             "confidence": state["confidence"],
+            "query_policy": self.query_policy,
+            "fusion_method": self.fusion_method,
         }
         with self.metrics_output_path.open("a") as f:
             f.write(json.dumps(event) + "\n")
@@ -318,10 +500,20 @@ class IntegratedBAOSystem:
 
     def get_system_statistics(self) -> Dict[str, Any]:
         n = max(1, self.metrics["flows_processed"])
+        query_total = float(self.metrics["total_query_cost"])
+        action_total = float(self.metrics["total_action_cost"])
+        utility_total = float(self.metrics["total_utility_cost"])
         return {
             "flows_processed": self.metrics["flows_processed"],
             "decision_counts": dict(self.metrics["decisions"]),
-            "avg_cost_per_flow": self.metrics["total_cost"] / n,
+            "avg_cost_per_flow": query_total / n,
+            "avg_query_cost_per_flow": query_total / n,
+            "avg_utility_cost_per_flow": utility_total / n,
+            "query_cost_total": query_total,
+            "action_cost_total": action_total,
+            "utility_cost_total": utility_total,
             "hitl_count": self.metrics["hitl_count"],
+            "query_policy": self.query_policy,
+            "fusion_method": self.fusion_method,
             "agent_utilization": {aid: calls / n for aid, calls in self.metrics["agent_calls"].items()},
         }

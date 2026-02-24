@@ -8,6 +8,8 @@ def compute_metrics(
     labels: List[int],
     probabilities: Optional[List[float]] = None,
     costs: Optional[List[float]] = None,
+    query_costs: Optional[List[float]] = None,
+    action_costs: Optional[List[float]] = None,
     approach: str = "unknown",
 ) -> Dict[str, float | int | str]:
     if len(predictions) != len(labels):
@@ -32,8 +34,20 @@ def compute_metrics(
         except Exception:
             auc = 0.5
 
-    total_cost = sum(costs) if costs else 0.0
-    avg_cost = total_cost / max(len(costs), 1) if costs else 0.0
+    if query_costs is None:
+        query_costs = costs
+    q_costs = list(query_costs or [])
+    a_costs = list(action_costs or [])
+    if q_costs and len(q_costs) != total:
+        raise ValueError(f"query_costs ({len(q_costs)}) and labels ({total}) must have same length")
+    if a_costs and len(a_costs) != total:
+        raise ValueError(f"action_costs ({len(a_costs)}) and labels ({total}) must have same length")
+
+    total_cost = sum(q_costs) if q_costs else 0.0
+    avg_cost = total_cost / max(total, 1)
+    action_cost_total = sum(a_costs) if a_costs else 0.0
+    utility_cost_total = total_cost + action_cost_total
+    utility_cost_per_flow = utility_cost_total / max(total, 1)
 
     return {
         "approach": approach,
@@ -45,6 +59,10 @@ def compute_metrics(
         "auc": round(auc, 6),
         "total_cost": round(total_cost, 4),
         "avg_cost_per_flow": round(avg_cost, 4),
+        "query_cost_total": round(total_cost, 4),
+        "action_cost_total": round(action_cost_total, 4),
+        "utility_cost_total": round(utility_cost_total, 4),
+        "utility_cost_per_flow": round(utility_cost_per_flow, 4),
         "true_positives": tp,
         "true_negatives": tn,
         "false_positives": fp,

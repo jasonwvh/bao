@@ -9,7 +9,8 @@ Containerized multi-agent orchestrator with a deterministic Bayesian cascade con
 - Shared state backend (SQLite) keyed by `agent_id`
 - Posterior-first belief updates with optional strict-likelihood mode
 - Expected-cost action selection (`accept` / `reject` / `defer`)
-- Approximate VOI query gating from configuration
+- Adaptive utility router (`ocsvm` first, then expected-gain selection)
+- Approximate VOI query gating for strict-cascade mode
 
 **Architecture diagram**
 
@@ -96,12 +97,14 @@ python3 agents/lstm_autoencoder/benchmark.py \
 python3 main.py \
   --dataset data/UNSW_NB15_testing-set.csv \
   --config config/orchestrator_config.yaml \
-  --max-agents 1 \
-  --agent-sequence lstm_autoencoder,ocsvm \
+  --max-agents 3 \
+  --agent-sequence ocsvm,lstm_autoencoder,wgan_gp \
+  --query-policy adaptive_router \
+  --fusion-method handoff_latest \
   --prediction-source decision \
   --output-dir artifacts/replay
 
-# Full matrix (all agents + BAO)
+# Full matrix (all agents + router profile + cost calibration + BAO)
 python3 benchmark/run_matrix.py \
   --dataset data/UNSW_NB15_testing-set.csv \
   --config config/orchestrator_config.yaml \
@@ -161,9 +164,13 @@ make down
 - `config/agents.yaml`: registry for containerized agents
 - `config/orchestrator_config.yaml`: source of truth for update mode, fusion, decision costs, query policy, VOI, and benchmark behavior
 - `config/agent_training.yaml`: source of truth for shared preprocessing and agent training/calibration hyperparameters
-- Query gating is fully dynamic for arbitrary agent counts:
+- Query routing is fully dynamic for arbitrary agent counts:
+  - `query.policy` (`adaptive_router` or `strict_cascade`)
+  - `query.first_agent`
   - `query.uncertainty_threshold`
   - `query.max_agents`
+  - `query.min_expected_gain`
+  - `routing.profile_path`
   - `voi.enabled` and `voi.rho`
 
 ## Project layout
@@ -190,3 +197,4 @@ make down
 - All inference is via A2A HTTP - agents are black boxes
 - One-agent parity is guaranteed in `posterior_first` mode when `query.max_agents=1`
 - Benchmark runs can reset state and emit reproducibility manifests
+- Matrix benchmark writes `utility_report.json` with query/action/utility cost metrics

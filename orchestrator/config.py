@@ -9,7 +9,10 @@ from typing import Any, Dict, Mapping, Optional
 import yaml
 
 UPDATE_MODES = {"posterior_first", "likelihood_strict"}
-FUSION_METHODS = {"logit_pool"}
+FUSION_METHODS = {"logit_pool", "handoff_latest", "utility_select"}
+QUERY_POLICIES = {"strict_cascade", "adaptive_router"}
+ROUTING_TIE_BREAKS = {"agent_sequence"}
+CALIBRATION_MODES = {"validation_derived"}
 PREDICTION_SOURCES = {"decision", "probability"}
 logger = logging.getLogger("orchestrator.config")
 
@@ -36,23 +39,42 @@ class FusionConfig:
 
 
 @dataclass(frozen=True)
+class CostCalibrationConfig:
+    enabled: bool
+    mode: str
+
+
+@dataclass(frozen=True)
 class DecisionConfig:
     policy: str
     c_fn: float
     c_fp: float
     c_h: float
+    accuracy_floor_delta: float
+    cost_calibration: CostCalibrationConfig
 
 
 @dataclass(frozen=True)
 class QueryConfig:
+    policy: str
     uncertainty_threshold: float
     max_agents: int
+    min_expected_gain: float
+    first_agent: Optional[str]
 
 
 @dataclass(frozen=True)
 class VOIConfig:
     enabled: bool
     rho: float
+
+
+@dataclass(frozen=True)
+class RoutingConfig:
+    profile_path: Optional[Path]
+    bin_count: int
+    min_samples_per_bin: int
+    tie_break: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +115,7 @@ class OrchestratorConfig:
     decision: DecisionConfig
     query: QueryConfig
     voi: VOIConfig
+    routing: RoutingConfig
     benchmark: BenchmarkConfig
     a2a: A2AConfig
     state: StateConfig
@@ -162,6 +185,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     decision_raw = dict(raw.get("decision", {}) or {})
     query_raw = dict(raw.get("query", {}) or {})
     voi_raw = dict(raw.get("voi", {}) or {})
+    routing_raw = dict(raw.get("routing", {}) or {})
     benchmark_raw = dict(raw.get("benchmark", {}) or {})
     a2a_raw = dict(raw.get("a2a", {}) or {})
     state_raw = dict(raw.get("state", {}) or {})
@@ -179,6 +203,10 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     fusion_method = str(fusion_raw.get("method", "logit_pool")).strip().lower()
     if fusion_method not in FUSION_METHODS:
         raise ValueError(f"unsupported fusion.method={fusion_method!r}")
+
+    query_policy = str(query_raw.get("policy", "strict_cascade")).strip().lower()
+    if query_policy not in QUERY_POLICIES:
+        raise ValueError(f"unsupported query.policy={query_policy!r}")
 
     prediction_source = str(benchmark_raw.get("prediction_source", "decision")).strip().lower()
     if prediction_source not in PREDICTION_SOURCES:
@@ -209,12 +237,30 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     max_agents = _to_int(query_raw.get("max_agents", orch_raw.get("max_iterations", 1)), 1)
     max_agents = max(1, max_agents)
 
+    min_expected_gain = _to_float(query_raw.get("min_expected_gain", 0.0), 0.0)
+    first_agent_value = query_raw.get("first_agent", "")
+    first_agent_raw = "" if first_agent_value is None else str(first_agent_value).strip()
+    first_agent = first_agent_raw if first_agent_raw else None
+
     weights_raw = fusion_raw.get("agent_weights", {})
     weights: Dict[str, float] = {}
     if isinstance(weights_raw, Mapping):
         for aid, value in weights_raw.items():
             w = _to_float(value, 1.0)
             weights[str(aid)] = max(1e-6, w)
+
+    cost_cal_raw = dict(decision_raw.get("cost_calibration", {}) or {})
+    cost_cal_mode = str(cost_cal_raw.get("mode", "validation_derived")).strip().lower()
+    if cost_cal_mode not in CALIBRATION_MODES:
+        raise ValueError(f"unsupported decision.cost_calibration.mode={cost_cal_mode!r}")
+    accuracy_floor_delta = _to_float(decision_raw.get("accuracy_floor_delta", 0.01), 0.01)
+    accuracy_floor_delta = max(0.0, min(1.0, accuracy_floor_delta))
+
+    profile_value = routing_raw.get("profile_path")
+    profile_path = _resolve_path(base_dir, profile_value, "") if profile_value else None
+    tie_break = str(routing_raw.get("tie_break", "agent_sequence")).strip().lower()
+    if tie_break not in ROUTING_TIE_BREAKS:
+        raise ValueError(f"unsupported routing.tie_break={tie_break!r}")
 
     state_path = _resolve_path(base_dir, state_raw.get("sqlite_path"), "../artifacts/state/bao_state.sqlite")
     jsonl_path = _resolve_path(base_dir, logging_raw.get("jsonl_path"), "../artifacts/replay/flows.jsonl")
@@ -243,14 +289,28 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             c_fn=_to_float(decision_raw.get("costs", {}).get("c_fn", legacy_costs.get("c_fn", 500.0)), 500.0),
             c_fp=_to_float(decision_raw.get("costs", {}).get("c_fp", legacy_costs.get("c_fp", 5.0)), 5.0),
             c_h=_to_float(decision_raw.get("costs", {}).get("c_h", legacy_costs.get("c_h", 5000.0)), 5000.0),
+            accuracy_floor_delta=accuracy_floor_delta,
+            cost_calibration=CostCalibrationConfig(
+                enabled=_to_bool(cost_cal_raw.get("enabled", False), False),
+                mode=cost_cal_mode,
+            ),
         ),
         query=QueryConfig(
+            policy=query_policy,
             uncertainty_threshold=uncertainty_threshold,
             max_agents=max_agents,
+            min_expected_gain=min_expected_gain,
+            first_agent=first_agent,
         ),
         voi=VOIConfig(
             enabled=_to_bool(voi_raw.get("enabled", True), True),
             rho=rho,
+        ),
+        routing=RoutingConfig(
+            profile_path=profile_path,
+            bin_count=max(2, _to_int(routing_raw.get("bin_count", 20), 20)),
+            min_samples_per_bin=max(1, _to_int(routing_raw.get("min_samples_per_bin", 20), 20)),
+            tie_break=tie_break,
         ),
         benchmark=BenchmarkConfig(
             reset_state=_to_bool(benchmark_raw.get("reset_state", True), True),

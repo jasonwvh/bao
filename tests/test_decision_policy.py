@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from orchestrator.decision import DecisionCosts, approximate_voi, select_expected_cost_action
+from orchestrator.decision import (
+    DecisionCosts,
+    approximate_voi,
+    min_expected_action_cost,
+    realized_action_cost,
+    select_expected_cost_action,
+)
 
 
 class DecisionPolicyTests(unittest.TestCase):
@@ -26,6 +32,17 @@ class DecisionPolicyTests(unittest.TestCase):
         voi = approximate_voi(0.5, costs, rho=0.7)
         self.assertGreater(voi, 1.0)
         self.assertLess(voi, 2.0)
+
+    def test_min_expected_action_cost(self) -> None:
+        costs = DecisionCosts(c_fn=100.0, c_fp=10.0, c_h=1000.0)
+        self.assertAlmostEqual(min_expected_action_cost(0.1, costs), 9.0, places=12)
+
+    def test_realized_action_cost_for_prediction(self) -> None:
+        costs = DecisionCosts(c_fn=100.0, c_fp=10.0, c_h=1000.0)
+        c_fp = realized_action_cost(decision=None, prediction=1, true_label=0, costs=costs)
+        c_fn = realized_action_cost(decision=None, prediction=0, true_label=1, costs=costs)
+        self.assertAlmostEqual(c_fp, 10.0, places=12)
+        self.assertAlmostEqual(c_fn, 100.0, places=12)
 
 
 if __name__ == "__main__":

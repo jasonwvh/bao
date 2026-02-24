@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from typing import Dict, List
 
+import json
 import yaml
 
 from orchestrator.integrated_system import IntegratedBAOSystem
@@ -34,7 +35,18 @@ class _FakeA2A:
 
 
 class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
-    def _write_files(self, tmp: Path, sequence: List[str], max_agents: int) -> Path:
+    def _write_files(
+        self,
+        tmp: Path,
+        sequence: List[str],
+        max_agents: int,
+        *,
+        query_policy: str = "strict_cascade",
+        fusion_method: str = "logit_pool",
+        first_agent: str | None = None,
+        min_expected_gain: float = 0.0,
+        profile_path: str | None = None,
+    ) -> Path:
         ids = list(dict.fromkeys(sequence or ["agent_a", "agent_b"]))
         if len(ids) < 2:
             ids = ids + ["agent_b"]
@@ -80,10 +92,27 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
                 "eps": 1e-6,
                 "likelihood_sanity_gate": True,
             },
-            "fusion": {"method": "logit_pool", "agent_weights": {}},
-            "decision": {"policy": "expected_cost_min", "costs": {"c_fn": 500.0, "c_fp": 5.0, "c_h": 5000.0}},
-            "query": {"uncertainty_threshold": 0.6, "max_agents": max_agents},
+            "fusion": {"method": fusion_method, "agent_weights": {}},
+            "decision": {
+                "policy": "expected_cost_min",
+                "costs": {"c_fn": 500.0, "c_fp": 5.0, "c_h": 5000.0},
+                "accuracy_floor_delta": 0.01,
+                "cost_calibration": {"enabled": False, "mode": "validation_derived"},
+            },
+            "query": {
+                "policy": query_policy,
+                "uncertainty_threshold": 0.6,
+                "max_agents": max_agents,
+                "min_expected_gain": min_expected_gain,
+                "first_agent": first_agent,
+            },
             "voi": {"enabled": False, "rho": 0.7},
+            "routing": {
+                "profile_path": profile_path,
+                "bin_count": 20,
+                "min_samples_per_bin": 1,
+                "tie_break": "agent_sequence",
+            },
             "benchmark": {"reset_state": True, "prediction_source": "probability", "write_manifest": False},
             "a2a": {"retries": 0},
             "state": {"sqlite_path": str(tmp / "state.sqlite")},
@@ -151,6 +180,105 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(fake.calls, sequence)
             self.assertEqual(res["agents_queried"], sequence)
+
+    async def test_first_agent_forced_from_query_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sequence = ["agent_b", "agent_a", "agent_c"]
+            cfg_path = self._write_files(
+                Path(td),
+                sequence=sequence,
+                max_agents=2,
+                first_agent="agent_a",
+            )
+            system = IntegratedBAOSystem(cfg_path)
+            fake = _FakeA2A({"agent_a": [0.5], "agent_b": [0.7], "agent_c": [0.9]})
+            system.a2a = fake
+
+            res = await system.process_flow(
+                flow_features={"packet_count": 10.0},
+                flow_id="flow-first-agent",
+                timestamp=time.time(),
+                true_label=1,
+            )
+
+            self.assertEqual(fake.calls[0], "agent_a")
+            self.assertEqual(res["agents_queried"][0], "agent_a")
+
+    async def test_adaptive_router_selects_positive_gain_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            profile = {
+                "version": "v1",
+                "global": {
+                    "agent_b": {"accuracy": 1.0, "mean_probability": 0.9},
+                    "agent_c": {"accuracy": 1.0, "mean_probability": 0.51},
+                },
+                "pairwise": {
+                    "agent_a": {
+                        "agent_b": {
+                            "bins": [
+                                {
+                                    "lo": 0.0,
+                                    "hi": 1.0,
+                                    "count": 100,
+                                    "mean_target_probability": 0.9,
+                                    "target_accuracy": 1.0,
+                                }
+                            ]
+                        },
+                        "agent_c": {
+                            "bins": [
+                                {
+                                    "lo": 0.0,
+                                    "hi": 1.0,
+                                    "count": 100,
+                                    "mean_target_probability": 0.51,
+                                    "target_accuracy": 1.0,
+                                }
+                            ]
+                        },
+                    },
+                    "agent_b": {
+                        "agent_c": {
+                            "bins": [
+                                {
+                                    "lo": 0.0,
+                                    "hi": 1.0,
+                                    "count": 100,
+                                    "mean_target_probability": 0.52,
+                                    "target_accuracy": 1.0,
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+            profile_path = tmp / "router_profile.json"
+            profile_path.write_text(json.dumps(profile))
+
+            cfg_path = self._write_files(
+                tmp,
+                sequence=["agent_a", "agent_b", "agent_c"],
+                max_agents=3,
+                query_policy="adaptive_router",
+                fusion_method="handoff_latest",
+                first_agent="agent_a",
+                min_expected_gain=0.0,
+                profile_path=str(profile_path),
+            )
+            system = IntegratedBAOSystem(cfg_path)
+            fake = _FakeA2A({"agent_a": [0.5], "agent_b": [0.9], "agent_c": [0.51]})
+            system.a2a = fake
+
+            res = await system.process_flow(
+                flow_features={"packet_count": 10.0},
+                flow_id="flow-adaptive",
+                timestamp=time.time(),
+                true_label=1,
+            )
+
+            self.assertEqual(fake.calls, ["agent_a", "agent_b"])
+            self.assertEqual(res["agents_queried"], ["agent_a", "agent_b"])
 
     async def test_single_agent_parity_in_posterior_first_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:

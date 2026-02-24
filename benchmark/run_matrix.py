@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
 from typing import List
+
+from benchmark.metrics import compute_metrics
+from orchestrator.decision import DecisionCosts, realized_action_cost
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +23,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-flows", type=int, default=0, help="Limit number of flows (0=all)")
     p.add_argument("--prediction-source", choices=["decision", "probability"], default="probability")
     p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--build-profile", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--calibrate-costs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--router-profile", default=None, help="Router profile output path")
+    p.add_argument("--calibration-json", default=None, help="Cost calibration output JSON")
+    p.add_argument("--calibrated-config", default=None, help="Calibrated orchestrator config output path")
     return p.parse_args()
 
 
@@ -27,6 +36,35 @@ def _run(cmd: List[str]) -> None:
     proc = subprocess.run(cmd, cwd=str(REPO_ROOT))
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed with exit code {proc.returncode}: {' '.join(cmd)}")
+
+
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def _agent_metrics_with_costs(replay_path: Path, *, per_call_cost: float, costs: DecisionCosts, approach: str) -> dict:
+    rows = _load_json(replay_path)
+    predictions = [int(r["prediction"]) for r in rows]
+    labels = [int(r["true_label"]) for r in rows]
+    probabilities = [float(r["probability"]) for r in rows]
+    query_costs = [float(per_call_cost)] * len(rows)
+    action_costs = [
+        realized_action_cost(
+            decision=None,
+            prediction=int(r["prediction"]),
+            true_label=int(r["true_label"]),
+            costs=costs,
+        )
+        for r in rows
+    ]
+    return compute_metrics(
+        predictions=predictions,
+        labels=labels,
+        probabilities=probabilities,
+        query_costs=query_costs,
+        action_costs=action_costs,
+        approach=approach,
+    )
 
 
 def main() -> None:
@@ -82,6 +120,42 @@ def main() -> None:
             *max_flows_args,
         ]
     )
+
+    profile_path = Path(args.router_profile) if args.router_profile else (out_root / "router_profile.json")
+    if args.build_profile:
+        _run(
+            [
+                sys.executable,
+                "benchmark/build_router_profile.py",
+                "--input-root",
+                str(out_root),
+                "--output-path",
+                str(profile_path),
+            ]
+        )
+
+    calibrated_config = Path(args.config)
+    calibration_json: Path | None = None
+    if args.calibrate_costs:
+        calibration_json = Path(args.calibration_json) if args.calibration_json else (out_root / "cost_calibration.json")
+        calibrated_config = Path(args.calibrated_config) if args.calibrated_config else (out_root / "orchestrator_calibrated.yaml")
+        _run(
+            [
+                sys.executable,
+                "benchmark/calibrate_decision_costs.py",
+                "--input-root",
+                str(out_root),
+                "--profile-path",
+                str(profile_path),
+                "--base-config",
+                str(args.config),
+                "--output-json",
+                str(calibration_json),
+                "--output-config",
+                str(calibrated_config),
+            ]
+        )
+
     _run(
         [
             sys.executable,
@@ -89,7 +163,7 @@ def main() -> None:
             "--dataset",
             args.dataset,
             "--config",
-            args.config,
+            str(calibrated_config),
             "--output-dir",
             str(out_root / "bao"),
             "--prediction-source",
@@ -99,9 +173,42 @@ def main() -> None:
         ]
     )
 
+    summary = {
+        "ocsvm": _load_json(out_root / "ocsvm" / "benchmark_ocsvm.json"),
+        "lstm_autoencoder": _load_json(out_root / "lstm_autoencoder" / "benchmark_lstm_autoencoder.json"),
+        "wgan_gp": _load_json(out_root / "wgan_gp" / "benchmark_wgan_gp.json"),
+        "bao": _load_json(out_root / "bao" / "benchmark_bao.json"),
+    }
+    if calibration_json is not None and calibration_json.exists():
+        cal = _load_json(calibration_json)
+        costs = DecisionCosts(
+            c_fn=float(cal.get("c_fn", 500.0)),
+            c_fp=float(cal.get("c_fp", 5.0)),
+            c_h=float(cal.get("c_h", 5000.0)),
+        )
+        summary["costs_used_for_recalibration"] = {"c_fn": costs.c_fn, "c_fp": costs.c_fp, "c_h": costs.c_h}
+        summary["ocsvm_recalibrated_costs"] = _agent_metrics_with_costs(
+            out_root / "ocsvm" / "replay_results_ocsvm.json",
+            per_call_cost=1.0,
+            costs=costs,
+            approach="ocsvm_recalibrated",
+        )
+        summary["lstm_autoencoder_recalibrated_costs"] = _agent_metrics_with_costs(
+            out_root / "lstm_autoencoder" / "replay_results_lstm_autoencoder.json",
+            per_call_cost=3.0,
+            costs=costs,
+            approach="lstm_autoencoder_recalibrated",
+        )
+        summary["wgan_gp_recalibrated_costs"] = _agent_metrics_with_costs(
+            out_root / "wgan_gp" / "replay_results_wgan_gp.json",
+            per_call_cost=5.0,
+            costs=costs,
+            approach="wgan_gp_recalibrated",
+        )
+    (out_root / "utility_report.json").write_text(json.dumps(summary, indent=2))
+
     print(f"Benchmark matrix complete: {out_root}")
 
 
 if __name__ == "__main__":
     main()
-

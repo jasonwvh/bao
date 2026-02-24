@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,10 @@ def select_expected_cost_action(p_mal: float, costs: DecisionCosts) -> tuple[str
     return action, action_costs
 
 
+def min_expected_action_cost(p_mal: float, costs: DecisionCosts) -> float:
+    return min(expected_action_costs(p_mal, costs).values())
+
+
 def perfect_information_cost(p_mal: float, costs: DecisionCosts) -> float:
     p = max(0.0, min(1.0, float(p_mal)))
     # True state s=1 (malicious): reject is optimal with zero cost.
@@ -37,6 +41,36 @@ def perfect_information_cost(p_mal: float, costs: DecisionCosts) -> float:
 
 def approximate_voi(p_mal: float, costs: DecisionCosts, rho: float) -> float:
     rho_clipped = max(0.0, min(1.0, float(rho)))
-    current = min(expected_action_costs(p_mal, costs).values())
+    current = min_expected_action_cost(p_mal, costs)
     perfect = perfect_information_cost(p_mal, costs)
     return rho_clipped * max(0.0, current - perfect)
+
+
+def realized_action_cost(
+    *,
+    decision: Optional[str],
+    prediction: Optional[int],
+    true_label: Optional[int],
+    costs: DecisionCosts,
+) -> float:
+    if true_label is None:
+        return 0.0
+
+    y = int(true_label)
+    if decision is not None:
+        d = str(decision).strip().lower()
+        if d == "defer":
+            return float(costs.c_h)
+        if d == "accept":
+            return float(costs.c_fn) if y == 1 else 0.0
+        if d == "reject":
+            return float(costs.c_fp) if y == 0 else 0.0
+
+    if prediction is None:
+        return 0.0
+    p = int(prediction)
+    if p == 0 and y == 1:
+        return float(costs.c_fn)
+    if p == 1 and y == 0:
+        return float(costs.c_fp)
+    return 0.0

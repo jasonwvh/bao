@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from benchmark.metrics import compute_metrics
 from orchestrator.config import file_sha256
-from orchestrator.decision import DecisionCosts, select_expected_cost_action
+from orchestrator.decision import DecisionCosts, realized_action_cost, select_expected_cost_action
 
 
 MODEL_PATH_BY_AGENT = {
@@ -18,7 +18,7 @@ MODEL_PATH_BY_AGENT = {
     "wgan_gp": Path("agents/wgan_gp/models/wgan_gp.pt"),
 }
 
-DEFAULT_DECISION_COSTS = DecisionCosts(c_fn=500.0, c_fp=5.0, c_h=5000.0)
+DEFAULT_DECISION_COSTS = DecisionCosts(c_fn=25.0, c_fp=1.0, c_h=100.0)
 
 
 @dataclass
@@ -27,7 +27,9 @@ class BenchmarkAccumulator:
     predictions: List[int] = field(default_factory=list)
     labels: List[int] = field(default_factory=list)
     probabilities: List[float] = field(default_factory=list)
-    costs: List[float] = field(default_factory=list)
+    query_costs: List[float] = field(default_factory=list)
+    action_costs: List[float] = field(default_factory=list)
+    decision_costs: DecisionCosts = field(default_factory=lambda: DEFAULT_DECISION_COSTS)
 
     def add_sample(
         self,
@@ -44,19 +46,29 @@ class BenchmarkAccumulator:
             probability=p,
             decision=decision,
             label_hint=label_hint,
+            decision_costs=self.decision_costs,
+        )
+        action_cost = realized_action_cost(
+            decision=decision,
+            prediction=pred,
+            true_label=int(true_label),
+            costs=self.decision_costs,
         )
 
         self.labels.append(int(true_label))
         self.probabilities.append(p)
         self.predictions.append(int(pred))
-        self.costs.append(float(cost))
+        self.query_costs.append(float(cost))
+        self.action_costs.append(float(action_cost))
 
     def compute(self, approach: str) -> Dict[str, Any]:
         return compute_metrics(
             predictions=self.predictions,
             labels=self.labels,
             probabilities=self.probabilities,
-            costs=self.costs,
+            costs=self.query_costs,
+            query_costs=self.query_costs,
+            action_costs=self.action_costs,
             approach=approach,
         )
 
@@ -67,9 +79,11 @@ def infer_prediction(
     probability: float,
     decision: Optional[str] = None,
     label_hint: Optional[str] = None,
+    decision_costs: Optional[DecisionCosts] = None,
 ) -> int:
     src = str(prediction_source).strip().lower()
     p = float(probability)
+    costs = decision_costs or DEFAULT_DECISION_COSTS
 
     if src == "decision":
         if decision is not None:
@@ -79,7 +93,7 @@ def infer_prediction(
             if d == "accept":
                 return 0
             # For defer/more_agents/unknown, fall through to posterior threshold.
-        action, _ = select_expected_cost_action(p, DEFAULT_DECISION_COSTS)
+        action, _ = select_expected_cost_action(p, costs)
         if action == "reject":
             return 1
         if action == "accept":

@@ -4,7 +4,7 @@ import copy
 import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 
 def _sigmoid(x: float) -> float:
@@ -135,6 +135,37 @@ class BayesianBeliefState:
         self._p_cached = _clip(pooled_prob, self.eps, 1.0 - self.eps)
         self.var = _clip(1.0 / max(self._pooled_weight_sum, self.eps), 1e-4, 4.0)
         return self._p_cached
+
+    def posterior_handoff_latest(self, p_mal: float, weight: float = 1.0) -> float:
+        self.set_compromise_prob(p_mal)
+        w = max(self.eps, float(weight))
+        self.var = _clip(1.0 / w, 1e-4, 4.0)
+        return self.get_compromise_prob()
+
+    def posterior_utility_select(
+        self,
+        *,
+        agent_probabilities: Dict[str, float],
+        reliability_lookup: Dict[str, float],
+        action_cost_fn: Callable[[float], float],
+    ) -> Tuple[str, float]:
+        if not agent_probabilities:
+            p = self.get_compromise_prob()
+            return ("", p)
+
+        best_agent = ""
+        best_prob = self.get_compromise_prob()
+        best_proxy = float("inf")
+        for aid, p in agent_probabilities.items():
+            rel = max(self.eps, float(reliability_lookup.get(aid, 0.5)))
+            proxy = float(action_cost_fn(float(p))) / rel
+            if proxy < best_proxy:
+                best_proxy = proxy
+                best_agent = aid
+                best_prob = _clip(float(p), self.eps, 1.0 - self.eps)
+
+        self.set_compromise_prob(best_prob)
+        return best_agent, self.get_compromise_prob()
 
     def update_from_agent_output(
         self,
