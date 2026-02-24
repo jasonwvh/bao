@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -16,6 +17,7 @@ from benchmark.runner import (
     BenchmarkAccumulator,
     build_benchmark_manifest,
     dataset_composition,
+    infer_prediction,
     write_json,
 )
 from orchestrator.config import PREDICTION_SOURCES
@@ -78,6 +80,7 @@ def main() -> None:
         raise RuntimeError("No rows loaded from dataset")
 
     acc = BenchmarkAccumulator(prediction_source=args.prediction_source)
+    replay_rows = []
 
     for idx, row in enumerate(rows):
         true_label = row.get("true_label")
@@ -93,11 +96,27 @@ def main() -> None:
             cost=per_call_cost,
             label_hint=(output.get("prediction") or {}).get("label"),
         )
+        pred = infer_prediction(
+            prediction_source=args.prediction_source,
+            probability=p_mal,
+            label_hint=(output.get("prediction") or {}).get("label"),
+        )
+        replay_rows.append(
+            {
+                "flow_id": row["flow_id"],
+                "true_label": int(true_label),
+                "prediction": int(pred),
+                "probability": float(p_mal),
+                "agent_id": "ocsvm",
+            }
+        )
 
         if (idx + 1) % 500 == 0:
             logger.info("[%d/%d] flow_id=%s p_mal=%.4f", idx + 1, len(rows), row["flow_id"], p_mal)
 
     metrics = acc.compute(approach="ocsvm")
+    replay_path = output_dir / "replay_results.json"
+    replay_path.write_text(json.dumps(replay_rows, indent=2))
 
     benchmark_path = output_dir / "benchmark_ocsvm.json"
     write_json(benchmark_path, metrics)
@@ -126,6 +145,7 @@ def main() -> None:
     print(f"Total cost: {metrics['total_cost']:.4f}")
     print(f"Avg cost/flow: {metrics['avg_cost_per_flow']:.4f}")
     print(f"Output: {benchmark_path}")
+    print(f"Replay output: {replay_path}")
 
 
 if __name__ == "__main__":

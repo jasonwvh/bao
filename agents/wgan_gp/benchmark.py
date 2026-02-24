@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 import uuid
@@ -15,6 +16,7 @@ from benchmark.runner import (
     BenchmarkAccumulator,
     build_benchmark_manifest,
     dataset_composition,
+    infer_prediction,
     write_json,
 )
 from orchestrator.config import PREDICTION_SOURCES
@@ -74,6 +76,7 @@ def main() -> None:
         raise RuntimeError("No rows loaded from dataset")
 
     acc = BenchmarkAccumulator(prediction_source=args.prediction_source)
+    replay_rows = []
 
     for row in rows:
         true_label = row.get("true_label")
@@ -89,8 +92,24 @@ def main() -> None:
             cost=per_call_cost,
             label_hint=(output.get("prediction") or {}).get("label"),
         )
+        pred = infer_prediction(
+            prediction_source=args.prediction_source,
+            probability=p_mal,
+            label_hint=(output.get("prediction") or {}).get("label"),
+        )
+        replay_rows.append(
+            {
+                "flow_id": row["flow_id"],
+                "true_label": int(true_label),
+                "prediction": int(pred),
+                "probability": float(p_mal),
+                "agent_id": "wgan_gp",
+            }
+        )
 
     metrics = acc.compute(approach="wgan_gp")
+    replay_path = output_dir / "replay_results.json"
+    replay_path.write_text(json.dumps(replay_rows, indent=2))
 
     benchmark_path = output_dir / "benchmark_wgan_gp.json"
     write_json(benchmark_path, metrics)
@@ -119,6 +138,7 @@ def main() -> None:
     print(f"Total cost: {metrics['total_cost']:.4f}")
     print(f"Avg cost/flow: {metrics['avg_cost_per_flow']:.4f}")
     print(f"Output: {benchmark_path}")
+    print(f"Replay output: {replay_path}")
 
 
 if __name__ == "__main__":

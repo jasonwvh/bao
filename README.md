@@ -88,6 +88,10 @@ python3 agents/lstm_autoencoder/benchmark.py \
   --prediction-source decision \
   --output-dir artifacts/replay
 
+# Each agent benchmark writes:
+# - benchmark_<agent>.json
+# - replay_results.json (per-row predictions)
+
 # BAO replay
 python3 main.py \
   --dataset data/UNSW_NB15_testing-set.csv \
@@ -150,6 +154,9 @@ make down
 
 - `config/agents.yaml`: registry for containerized agents
 - `config/orchestrator_config.yaml`: source of truth for update mode, fusion, decision costs, query policy, VOI, and benchmark behavior
+- Query gating supports stage-specific uncertainty thresholds:
+  - `query.uncertainty_threshold_stage1` (agent1 -> agent2)
+  - `query.uncertainty_threshold_stage2` (agent2 -> agent3+)
 
 ## Project layout
 

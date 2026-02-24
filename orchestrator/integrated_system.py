@@ -114,8 +114,20 @@ class IntegratedBAOSystem:
         max_agents = min(int(self.config_obj.query.max_agents), len(candidates))
         return candidates[:max_agents]
 
-    def _query_decision(self, p_mal: float, uncertainty: float, next_agent_cost: float) -> tuple[bool, float]:
-        if uncertainty <= float(self.config_obj.query.uncertainty_threshold):
+    def _query_decision(
+        self,
+        p_mal: float,
+        uncertainty: float,
+        next_agent_cost: float,
+        stage_index: int,
+    ) -> tuple[bool, float]:
+        threshold = (
+            float(self.config_obj.query.uncertainty_threshold_stage1)
+            if stage_index <= 0
+            else float(self.config_obj.query.uncertainty_threshold_stage2)
+        )
+
+        if uncertainty <= threshold:
             return False, 0.0
 
         if not self.config_obj.voi.enabled:
@@ -245,6 +257,7 @@ class IntegratedBAOSystem:
                 p_mal=state["compromise_prob"],
                 uncertainty=state["epistemic_uncertainty"],
                 next_agent_cost=float(self.agent_handles[next_agent].cost),
+                stage_index=idx,
             )
             state["voi_scores"][next_agent] = float(voi_value)
             if not should_query:
