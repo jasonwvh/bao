@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import random
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -25,11 +26,12 @@ class RouterScore:
     current_action_cost: float
     expected_action_cost_after: float
     query_cost: float
-    utilization_penalty: float
+    utilization_adjustment: float
     reliability: float
     estimated_candidate_prob: float
     estimated_p_after: float
     profile_source: str
+    selection_mode: str = "candidate"
 
     def to_dict(self) -> Dict[str, float | str]:
         return {
@@ -39,11 +41,12 @@ class RouterScore:
             "current_action_cost": self.current_action_cost,
             "expected_action_cost_after": self.expected_action_cost_after,
             "query_cost": self.query_cost,
-            "utilization_penalty": self.utilization_penalty,
+            "utilization_adjustment": self.utilization_adjustment,
             "reliability": self.reliability,
             "estimated_candidate_prob": self.estimated_candidate_prob,
             "estimated_p_after": self.estimated_p_after,
             "profile_source": self.profile_source,
+            "selection_mode": self.selection_mode,
         }
 
 
@@ -56,10 +59,12 @@ class AdaptiveRouter:
         decision_costs: DecisionCosts,
         profile_path: Optional[Path] = None,
         min_samples_per_bin: int = 20,
+        seed: Optional[int] = None,
     ):
         self.decision_costs = decision_costs
         self.profile_path = profile_path
         self.min_samples_per_bin = max(1, int(min_samples_per_bin))
+        self.rng = random.Random(seed)
         self.profile: Dict[str, Any] = {}
         self._global_stats: Dict[str, Dict[str, float]] = {}
         self._pairwise_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -155,6 +160,7 @@ class AdaptiveRouter:
         candidate_agents: Iterable[str],
         agent_handles: Dict[str, AgentRuntimeHandle],
         belief_manager: Any,
+        utilization_adjustments: Optional[Dict[str, float]] = None,
         utilization_penalties: Optional[Dict[str, float]] = None,
     ) -> Dict[str, RouterScore]:
         p_current = _clip_probability(current_probability)
@@ -177,8 +183,11 @@ class AdaptiveRouter:
             after_cost = _min_expected_action_cost(p_after, self.decision_costs)
             query_cost = float(handle.cost)
             gain = current_cost - after_cost - query_cost
-            util_penalty = float((utilization_penalties or {}).get(aid, 0.0))
-            gain_adjusted = gain - util_penalty
+            util_adjustment = float((utilization_adjustments or {}).get(aid, 0.0))
+            # Backward compatibility: convert old positive penalty style to signed adjustment.
+            if utilization_adjustments is None and utilization_penalties is not None:
+                util_adjustment = -float((utilization_penalties or {}).get(aid, 0.0))
+            gain_adjusted = gain + util_adjustment
             scores[aid] = RouterScore(
                 agent_id=aid,
                 expected_gain=float(gain),
@@ -186,13 +195,35 @@ class AdaptiveRouter:
                 current_action_cost=float(current_cost),
                 expected_action_cost_after=float(after_cost),
                 query_cost=query_cost,
-                utilization_penalty=float(util_penalty),
+                utilization_adjustment=float(util_adjustment),
                 reliability=float(reliability),
                 estimated_candidate_prob=float(est_prob),
                 estimated_p_after=float(p_after),
                 profile_source=profile_src,
             )
         return scores
+
+    def _weighted_choice(
+        self,
+        *,
+        ordered_candidates: list[str],
+        weights: Dict[str, float],
+    ) -> Optional[str]:
+        total = 0.0
+        clean_weights: Dict[str, float] = {}
+        for aid in ordered_candidates:
+            w = max(0.0, float(weights.get(aid, 0.0)))
+            clean_weights[aid] = w
+            total += w
+        if total <= 0.0:
+            return ordered_candidates[0] if ordered_candidates else None
+        r = self.rng.random() * total
+        running = 0.0
+        for aid in ordered_candidates:
+            running += clean_weights[aid]
+            if running >= r:
+                return aid
+        return ordered_candidates[-1] if ordered_candidates else None
 
     def select_next_agent(
         self,
@@ -203,18 +234,39 @@ class AdaptiveRouter:
         agent_handles: Dict[str, AgentRuntimeHandle],
         belief_manager: Any,
         min_expected_gain: float,
+        utilization_adjustments: Optional[Dict[str, float]] = None,
         utilization_penalties: Optional[Dict[str, float]] = None,
-    ) -> Tuple[Optional[str], Dict[str, RouterScore]]:
+        exploration_enabled: bool = False,
+        exploration_base_rate: float = 0.0,
+        exploration_max_rate: float = 0.10,
+        force_under_target_topup: bool = False,
+        uncertainty_allows_exploration: bool = True,
+    ) -> Tuple[Optional[str], Dict[str, RouterScore], str]:
         scores = self.score_candidates(
             current_probability=current_probability,
             source_agent=source_agent,
             candidate_agents=candidate_agents,
             agent_handles=agent_handles,
             belief_manager=belief_manager,
+            utilization_adjustments=utilization_adjustments,
             utilization_penalties=utilization_penalties,
         )
         if not scores:
-            return None, {}
+            return None, {}, "stop"
+
+        adjustments = dict(utilization_adjustments or {})
+        if utilization_adjustments is None and utilization_penalties is not None:
+            adjustments = {aid: -float(v) for aid, v in (utilization_penalties or {}).items()}
+
+        # Agents with positive adjustment are under target and candidates for top-up.
+        under_target = [aid for aid in candidate_agents if float(adjustments.get(aid, 0.0)) > 0.0]
+        total_deficit = sum(float(adjustments.get(aid, 0.0)) for aid in under_target)
+        explore_probability = 0.0
+        if uncertainty_allows_exploration and exploration_enabled and under_target:
+            explore_probability = min(
+                max(0.0, float(exploration_max_rate)),
+                max(0.0, float(exploration_base_rate)) + max(0.0, float(total_deficit)),
+            )
 
         # Deterministic tie-break: candidate ordering from agent_sequence.
         best_agent: Optional[str] = None
@@ -225,8 +277,26 @@ class AdaptiveRouter:
                 best_agent = aid
                 best_score = score
 
-        if best_agent is None or best_score is None:
-            return None, scores
-        if float(best_score.expected_gain_adjusted) <= float(min_expected_gain):
-            return None, scores
-        return best_agent, scores
+        selected_agent: Optional[str] = None
+        selection_mode = "stop"
+        if explore_probability > 0.0 and self.rng.random() < explore_probability:
+            selected_agent = self._weighted_choice(
+                ordered_candidates=under_target,
+                weights={aid: max(0.0, float(adjustments.get(aid, 0.0))) for aid in under_target},
+            )
+            if selected_agent is not None:
+                selection_mode = "explore_topup"
+        elif best_agent is not None and best_score is not None and float(best_score.expected_gain_adjusted) > float(min_expected_gain):
+            selected_agent = best_agent
+            selection_mode = "exploit"
+        elif force_under_target_topup and under_target:
+            selected_agent = self._weighted_choice(
+                ordered_candidates=under_target,
+                weights={aid: max(0.0, float(adjustments.get(aid, 0.0))) for aid in under_target},
+            )
+            if selected_agent is not None:
+                selection_mode = "force_topup"
+
+        if selected_agent is not None and selected_agent in scores:
+            scores[selected_agent] = replace(scores[selected_agent], selection_mode=selection_mode)
+        return selected_agent, scores, selection_mode

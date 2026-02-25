@@ -68,9 +68,17 @@ class DecisionConfig:
 class QueryConfig:
     policy: str
     uncertainty_threshold: float
+    apply_uncertainty_gate_in_adaptive: bool
     max_agents: int
     min_expected_gain: float
     first_agent: Optional[str]
+    force_under_target_topup: bool
+    exploration_enabled: bool
+    exploration_seed: Optional[int]
+    exploration_base_rate: float
+    exploration_max_rate: float
+    exploration_uncertainty_threshold: float
+    escalation_ordered: bool
     utilization_targets: list["UtilizationTargetConfig"]
     utilization_warmup_flows: int
 
@@ -96,7 +104,7 @@ class UtilizationTargetConfig:
     agent_id: str
     min_rate: float
     max_rate: float
-    penalty_under: float
+    bonus_under: float
     penalty_over: float
 
 
@@ -232,12 +240,19 @@ def _as_utilization_targets(value: Any) -> list[UtilizationTargetConfig]:
         max_rate = _to_float(item.get("max_rate", 1.0), 1.0)
         if max_rate < min_rate:
             min_rate, max_rate = max_rate, min_rate
+        bonus_under_raw = item.get("bonus_under", None)
+        if bonus_under_raw is None and "penalty_under" in item:
+            bonus_under_raw = item.get("penalty_under")
+            logger.warning(
+                "query.utilization_targets[%s].penalty_under is deprecated; use bonus_under",
+                agent_id,
+            )
         out.append(
             UtilizationTargetConfig(
                 agent_id=agent_id,
                 min_rate=max(0.0, min(1.0, min_rate)),
                 max_rate=max(0.0, min(1.0, max_rate)),
-                penalty_under=max(0.0, _to_float(item.get("penalty_under", 0.0), 0.0)),
+                bonus_under=max(0.0, _to_float(bonus_under_raw, 0.0)),
                 penalty_over=max(0.0, _to_float(item.get("penalty_over", 0.0), 0.0)),
             )
         )
@@ -303,6 +318,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     )
     # Entropy for Bernoulli lives in [0, ln 2]
     uncertainty_threshold = max(0.0, min(0.69314718056, uncertainty_threshold))
+    exploration_uncertainty_threshold = _to_float(
+        query_raw.get("exploration_uncertainty_threshold", uncertainty_threshold),
+        uncertainty_threshold,
+    )
+    exploration_uncertainty_threshold = max(0.0, min(0.69314718056, exploration_uncertainty_threshold))
     # Backward compatibility: stage-specific thresholds are deprecated.
     if "uncertainty_threshold_stage1" in query_raw or "uncertainty_threshold_stage2" in query_raw:
         logger.warning(
@@ -310,10 +330,23 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             "use query.uncertainty_threshold only"
         )
 
+    apply_uncertainty_gate_in_adaptive = _to_bool(
+        query_raw.get("apply_uncertainty_gate_in_adaptive", True),
+        True,
+    )
     max_agents = _to_int(query_raw.get("max_agents", orch_raw.get("max_iterations", 1)), 1)
     max_agents = max(1, max_agents)
 
     min_expected_gain = _to_float(query_raw.get("min_expected_gain", 0.0), 0.0)
+    force_under_target_topup = _to_bool(query_raw.get("force_under_target_topup", True), True)
+    exploration_enabled = _to_bool(query_raw.get("exploration_enabled", True), True)
+    exploration_seed_raw = query_raw.get("exploration_seed", orch_raw.get("seed", 7))
+    exploration_seed = None if exploration_seed_raw is None else _to_int(exploration_seed_raw, 7)
+    exploration_base_rate = _to_float(query_raw.get("exploration_base_rate", 0.0), 0.0)
+    exploration_base_rate = max(0.0, min(1.0, exploration_base_rate))
+    exploration_max_rate = _to_float(query_raw.get("exploration_max_rate", 0.10), 0.10)
+    exploration_max_rate = max(exploration_base_rate, min(1.0, exploration_max_rate))
+    escalation_ordered = _to_bool(query_raw.get("escalation_ordered", True), True)
     first_agent_value = query_raw.get("first_agent", "")
     first_agent_raw = "" if first_agent_value is None else str(first_agent_value).strip()
     first_agent = first_agent_raw if first_agent_raw else None
@@ -422,9 +455,17 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         query=QueryConfig(
             policy=query_policy,
             uncertainty_threshold=uncertainty_threshold,
+            apply_uncertainty_gate_in_adaptive=apply_uncertainty_gate_in_adaptive,
             max_agents=max_agents,
             min_expected_gain=min_expected_gain,
             first_agent=first_agent,
+            force_under_target_topup=force_under_target_topup,
+            exploration_enabled=exploration_enabled,
+            exploration_seed=exploration_seed,
+            exploration_base_rate=exploration_base_rate,
+            exploration_max_rate=exploration_max_rate,
+            exploration_uncertainty_threshold=exploration_uncertainty_threshold,
+            escalation_ordered=escalation_ordered,
             utilization_targets=utilization_targets,
             utilization_warmup_flows=utilization_warmup_flows,
         ),

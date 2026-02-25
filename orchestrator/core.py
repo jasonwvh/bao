@@ -12,7 +12,7 @@ class UtilizationTarget:
     agent_id: str
     min_rate: float
     max_rate: float
-    penalty_under: float
+    bonus_under: float
     penalty_over: float
 
 
@@ -67,6 +67,25 @@ def compute_utilization_penalty(
     targets: Dict[str, UtilizationTarget],
     warmup_flows: int,
 ) -> float:
+    """Backward-compatible helper: returns only positive over-utilization penalty."""
+    adjustment = compute_utilization_adjustment(
+        agent_id=agent_id,
+        agent_calls=agent_calls,
+        flows_processed=flows_processed,
+        targets=targets,
+        warmup_flows=warmup_flows,
+    )
+    return max(0.0, -float(adjustment))
+
+
+def compute_utilization_adjustment(
+    *,
+    agent_id: str,
+    agent_calls: Dict[str, int],
+    flows_processed: int,
+    targets: Dict[str, UtilizationTarget],
+    warmup_flows: int,
+) -> float:
     if int(flows_processed) < int(max(0, warmup_flows)):
         return 0.0
 
@@ -77,7 +96,7 @@ def compute_utilization_penalty(
     rate = float(agent_calls.get(agent_id, 0)) / float(max(1, int(flows_processed)))
     under = max(0.0, float(target.min_rate) - rate)
     over = max(0.0, rate - float(target.max_rate))
-    return (under * float(target.penalty_under)) + (over * float(target.penalty_over))
+    return (under * float(target.bonus_under)) - (over * float(target.penalty_over))
 
 
 def build_utilization_penalties(
@@ -88,6 +107,7 @@ def build_utilization_penalties(
     targets: Dict[str, UtilizationTarget],
     warmup_flows: int,
 ) -> Dict[str, float]:
+    """Backward-compatible helper: positive values only for over-utilized agents."""
     out: Dict[str, float] = {}
     for aid in candidate_agents:
         out[str(aid)] = compute_utilization_penalty(
@@ -97,6 +117,57 @@ def build_utilization_penalties(
             targets=targets,
             warmup_flows=warmup_flows,
         )
+    return out
+
+
+def build_utilization_adjustments(
+    *,
+    candidate_agents: Iterable[str],
+    agent_calls: Dict[str, int],
+    flows_processed: int,
+    targets: Dict[str, UtilizationTarget],
+    warmup_flows: int,
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for aid in candidate_agents:
+        out[str(aid)] = compute_utilization_adjustment(
+            agent_id=str(aid),
+            agent_calls=agent_calls,
+            flows_processed=flows_processed,
+            targets=targets,
+            warmup_flows=warmup_flows,
+        )
+    return out
+
+
+def build_utilization_diagnostics(
+    *,
+    agent_calls: Dict[str, int],
+    flows_processed: int,
+    targets: Dict[str, UtilizationTarget],
+    warmup_flows: int,
+) -> Dict[str, Dict[str, float]]:
+    rates = compute_utilization_rates(agent_calls=agent_calls, flows_processed=flows_processed)
+    out: Dict[str, Dict[str, float]] = {}
+    for aid, target in targets.items():
+        rate = float(rates.get(aid, 0.0))
+        under = max(0.0, float(target.min_rate) - rate)
+        over = max(0.0, rate - float(target.max_rate))
+        adjustment = compute_utilization_adjustment(
+            agent_id=aid,
+            agent_calls=agent_calls,
+            flows_processed=flows_processed,
+            targets=targets,
+            warmup_flows=warmup_flows,
+        )
+        out[str(aid)] = {
+            "rate": rate,
+            "min_rate": float(target.min_rate),
+            "max_rate": float(target.max_rate),
+            "under": under,
+            "over": over,
+            "adjustment": float(adjustment),
+        }
     return out
 
 

@@ -9,7 +9,7 @@ Containerized multi-agent orchestrator with a deterministic Bayesian cascade con
 - Shared state backend (SQLite) keyed by `agent_id`
 - Posterior-first belief updates with optional strict-likelihood mode
 - Expected-cost action selection (`accept` / `reject` / `defer`)
-- Adaptive utility router (dynamic cheapest-first + expected-gain selection)
+- Adaptive utility router (dynamic cheapest-first + expected-gain + utilization-band exploration)
 - Approximate VOI query gating for strict-cascade mode
 - Dual runtime support: deterministic default, optional LangGraph parity runtime
 - Split semantics: `decision` (classification) and `action_decision` (utility action)
@@ -182,8 +182,16 @@ make down
   - `query.policy` (`adaptive_router` or `strict_cascade`)
   - `query.first_agent`
   - `query.uncertainty_threshold`
+  - `query.apply_uncertainty_gate_in_adaptive`
   - `query.max_agents`
   - `query.min_expected_gain`
+  - `query.force_under_target_topup`
+  - `query.exploration_enabled`
+  - `query.exploration_seed`
+  - `query.exploration_base_rate`
+  - `query.exploration_max_rate`
+  - `query.exploration_uncertainty_threshold`
+  - `query.escalation_ordered`
   - `query.utilization_warmup_flows`
   - `query.utilization_targets`
   - `routing.profile_path`
@@ -193,6 +201,7 @@ make down
 - Runtime engine selection:
   - `orchestration.engine` (`deterministic` or `langgraph`)
   - `orchestration.first_agent_strategy` (`dynamic_cheapest` or `explicit`)
+- Static YAML operation is supported by default; `decision.cost_calibration.enabled` controls optional auto-recalibration in `main.py`
 
 ## Project layout
 

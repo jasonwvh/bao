@@ -36,6 +36,15 @@ class OrchestratorConfigTests(unittest.TestCase):
                     "uncertainty_threshold_stage2": 0.1,
                     "min_expected_gain": 0.3,
                     "max_agents": 3,
+                    "utilization_targets": [
+                        {
+                            "agent_id": "a1",
+                            "min_rate": 0.1,
+                            "max_rate": 0.2,
+                            "penalty_under": 3.0,
+                            "penalty_over": 4.0,
+                        }
+                    ],
                 },
                 "voi": {"enabled": True, "rho": 0.7},
                 "routing": {
@@ -58,8 +67,17 @@ class OrchestratorConfigTests(unittest.TestCase):
             self.assertEqual(int(loaded.query.max_agents), 3)
             self.assertEqual(loaded.query.first_agent, "a1")
             self.assertEqual(int(loaded.query.utilization_warmup_flows), 500)
-            self.assertEqual(len(loaded.query.utilization_targets), 0)
+            self.assertEqual(len(loaded.query.utilization_targets), 1)
+            self.assertAlmostEqual(float(loaded.query.utilization_targets[0].bonus_under), 3.0, places=12)
             self.assertAlmostEqual(float(loaded.query.min_expected_gain), 0.3, places=12)
+            self.assertTrue(bool(loaded.query.apply_uncertainty_gate_in_adaptive))
+            self.assertTrue(bool(loaded.query.force_under_target_topup))
+            self.assertTrue(bool(loaded.query.exploration_enabled))
+            self.assertEqual(int(loaded.query.exploration_seed), 7)
+            self.assertAlmostEqual(float(loaded.query.exploration_base_rate), 0.0, places=12)
+            self.assertAlmostEqual(float(loaded.query.exploration_max_rate), 0.1, places=12)
+            self.assertAlmostEqual(float(loaded.query.exploration_uncertainty_threshold), 0.64, places=12)
+            self.assertTrue(bool(loaded.query.escalation_ordered))
             self.assertEqual(loaded.fusion.method, "logit_pool")
             self.assertAlmostEqual(float(loaded.decision.accuracy_floor_delta), 0.02, places=12)
             self.assertTrue(bool(loaded.decision.cost_calibration.enabled))

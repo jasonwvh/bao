@@ -154,6 +154,16 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+def attach_routing_observability(metrics: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(metrics)
+    if not isinstance(summary, dict):
+        return out
+    for key in ("agent_utilization", "utilization_band_diagnostics", "routing_selection_counts"):
+        if key in summary:
+            out[key] = summary[key]
+    return out
+
+
 def reset_sqlite_state(db_path: Path) -> None:
     for suffix in ("", "-wal", "-shm"):
         candidate = Path(str(db_path) + suffix)

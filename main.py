@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from benchmark.runner import (
     BenchmarkAccumulator,
+    attach_routing_observability,
     build_benchmark_manifest,
     dataset_composition,
     reset_sqlite_state,
@@ -370,6 +371,7 @@ async def _run(args: argparse.Namespace) -> None:
     summary = system.get_system_statistics()
     summary_path = output_dir / "summary.json"
     write_json(summary_path, summary)
+    benchmark_metrics = attach_routing_observability(benchmark_metrics, summary)
 
     benchmark_path = output_dir / "benchmark_bao.json"
     write_json(benchmark_path, benchmark_metrics)

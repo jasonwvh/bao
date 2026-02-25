@@ -48,6 +48,7 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
         min_expected_gain: float = 0.0,
         profile_path: str | None = None,
         costs: Dict[str, float] | None = None,
+        query_overrides: Dict[str, object] | None = None,
     ) -> Path:
         ids = list(dict.fromkeys(sequence or ["agent_a", "agent_b"]))
         if len(ids) < 2:
@@ -82,6 +83,26 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
         }
         registry_path.write_text(yaml.dump(registry))
 
+        query_cfg = {
+            "policy": query_policy,
+            "uncertainty_threshold": 0.6,
+            "apply_uncertainty_gate_in_adaptive": True,
+            "max_agents": max_agents,
+            "min_expected_gain": min_expected_gain,
+            "first_agent": first_agent,
+            "force_under_target_topup": True,
+            "exploration_enabled": False,
+            "exploration_seed": 7,
+            "exploration_base_rate": 0.0,
+            "exploration_max_rate": 0.1,
+            "exploration_uncertainty_threshold": 0.6,
+            "escalation_ordered": True,
+            "utilization_targets": [],
+            "utilization_warmup_flows": 500,
+        }
+        if query_overrides:
+            query_cfg.update(query_overrides)
+
         cfg = {
             "orchestration": {
                 "seed": 7,
@@ -103,15 +124,7 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
                 "accuracy_floor_delta": 0.01,
                 "cost_calibration": {"enabled": False, "mode": "validation_derived"},
             },
-            "query": {
-                "policy": query_policy,
-                "uncertainty_threshold": 0.6,
-                "max_agents": max_agents,
-                "min_expected_gain": min_expected_gain,
-                "first_agent": first_agent,
-                "utilization_targets": [],
-                "utilization_warmup_flows": 500,
-            },
+            "query": query_cfg,
             "voi": {"enabled": False, "rho": 0.7},
             "routing": {
                 "profile_path": profile_path,
@@ -312,6 +325,129 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(fake.calls, ["agent_a", "agent_b"])
             self.assertEqual(res["agents_queried"], ["agent_a", "agent_b"])
+
+    async def test_adaptive_ordered_escalation_blocks_direct_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            profile = {
+                "version": "v1",
+                "global": {
+                    "agent_b": {"accuracy": 1.0, "mean_probability": 0.51},
+                    "agent_c": {"accuracy": 1.0, "mean_probability": 0.99},
+                },
+                "pairwise": {
+                    "agent_a": {
+                        "agent_b": {
+                            "bins": [
+                                {
+                                    "lo": 0.0,
+                                    "hi": 1.0,
+                                    "count": 100,
+                                    "mean_target_probability": 0.51,
+                                    "target_accuracy": 1.0,
+                                }
+                            ]
+                        },
+                        "agent_c": {
+                            "bins": [
+                                {
+                                    "lo": 0.0,
+                                    "hi": 1.0,
+                                    "count": 100,
+                                    "mean_target_probability": 0.99,
+                                    "target_accuracy": 1.0,
+                                }
+                            ]
+                        },
+                    }
+                },
+            }
+            profile_path = tmp / "router_profile.json"
+            profile_path.write_text(json.dumps(profile))
+
+            cfg_path = self._write_files(
+                tmp,
+                sequence=["agent_a", "agent_b", "agent_c"],
+                max_agents=2,
+                query_policy="adaptive_router",
+                fusion_method="handoff_latest",
+                first_agent="agent_a",
+                min_expected_gain=-100.0,
+                profile_path=str(profile_path),
+                query_overrides={"escalation_ordered": True},
+            )
+            system = IntegratedBAOSystem(cfg_path)
+            fake = _FakeA2A({"agent_a": [0.5], "agent_b": [0.51], "agent_c": [0.99]})
+            system.a2a = fake
+
+            res = await system.process_flow(
+                flow_features={"packet_count": 10.0},
+                flow_id="flow-ordered",
+                timestamp=time.time(),
+                true_label=1,
+            )
+
+            self.assertEqual(fake.calls, ["agent_a", "agent_b"])
+            self.assertEqual(res["agents_queried"], ["agent_a", "agent_b"])
+
+    async def test_adaptive_topup_targets_second_and_third_agent_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._write_files(
+                Path(td),
+                sequence=["agent_a", "agent_b", "agent_c"],
+                max_agents=3,
+                query_policy="adaptive_router",
+                fusion_method="handoff_latest",
+                first_agent="agent_a",
+                min_expected_gain=100.0,
+                query_overrides={
+                    "apply_uncertainty_gate_in_adaptive": False,
+                    "exploration_enabled": False,
+                    "force_under_target_topup": True,
+                    "utilization_warmup_flows": 0,
+                    "utilization_targets": [
+                        {
+                            "agent_id": "agent_b",
+                            "min_rate": 0.20,
+                            "max_rate": 0.30,
+                            "bonus_under": 8.0,
+                            "penalty_over": 16.0,
+                        },
+                        {
+                            "agent_id": "agent_c",
+                            "min_rate": 0.05,
+                            "max_rate": 0.10,
+                            "bonus_under": 10.0,
+                            "penalty_over": 20.0,
+                        },
+                    ],
+                },
+            )
+            system = IntegratedBAOSystem(cfg_path)
+            fake = _FakeA2A(
+                {
+                    "agent_a": [0.6] * 200,
+                    "agent_b": [0.6] * 200,
+                    "agent_c": [0.6] * 200,
+                }
+            )
+            system.a2a = fake
+
+            for i in range(200):
+                await system.process_flow(
+                    flow_features={"packet_count": 10.0},
+                    flow_id=f"flow-topup-{i}",
+                    timestamp=time.time(),
+                    true_label=1,
+                )
+
+            summary = system.get_system_statistics()
+            util = summary["agent_utilization"]
+            self.assertAlmostEqual(float(util["agent_a"]), 1.0, places=12)
+            self.assertGreaterEqual(float(util["agent_b"]), 0.18)
+            self.assertLessEqual(float(util["agent_b"]), 0.32)
+            self.assertGreaterEqual(float(util["agent_c"]), 0.04)
+            self.assertLessEqual(float(util["agent_c"]), 0.12)
 
     async def test_single_agent_parity_in_posterior_first_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:

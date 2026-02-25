@@ -22,7 +22,8 @@ from orchestrator.decision import (
 from orchestrator.core import (
     UtilizationTarget,
     apply_fusion_update,
-    build_utilization_penalties,
+    build_utilization_adjustments,
+    build_utilization_diagnostics,
     classify_from_probability,
     compute_utilization_rates,
     order_candidates,
@@ -87,6 +88,7 @@ class IntegratedBAOSystem:
                 decision_costs=self.decision_costs,
                 profile_path=self.config_obj.routing.profile_path,
                 min_samples_per_bin=int(self.config_obj.routing.min_samples_per_bin),
+                seed=self.config_obj.query.exploration_seed,
             )
         self.langgraph_runtime: Optional[LangGraphRuntime] = None
         if self.engine == "langgraph":
@@ -97,12 +99,19 @@ class IntegratedBAOSystem:
                 agent_id=t.agent_id,
                 min_rate=float(t.min_rate),
                 max_rate=float(t.max_rate),
-                penalty_under=float(t.penalty_under),
+                bonus_under=float(t.bonus_under),
                 penalty_over=float(t.penalty_over),
             )
             for t in self.config_obj.query.utilization_targets
         }
         self.utilization_warmup_flows = int(self.config_obj.query.utilization_warmup_flows)
+        self.apply_uncertainty_gate_in_adaptive = bool(self.config_obj.query.apply_uncertainty_gate_in_adaptive)
+        self.force_under_target_topup = bool(self.config_obj.query.force_under_target_topup)
+        self.exploration_enabled = bool(self.config_obj.query.exploration_enabled)
+        self.exploration_base_rate = float(self.config_obj.query.exploration_base_rate)
+        self.exploration_max_rate = float(self.config_obj.query.exploration_max_rate)
+        self.exploration_uncertainty_threshold = float(self.config_obj.query.exploration_uncertainty_threshold)
+        self.escalation_ordered = bool(self.config_obj.query.escalation_ordered)
 
         self.metrics = {
             "flows_processed": 0,
@@ -113,6 +122,7 @@ class IntegratedBAOSystem:
             "total_action_cost": 0.0,
             "total_utility_cost": 0.0,
             "hitl_count": 0,
+            "routing_selection_counts": {"exploit": 0, "explore_topup": 0, "force_topup": 0, "stop": 0},
         }
 
     def _apply_health_filter(self) -> None:
@@ -184,6 +194,24 @@ class IntegratedBAOSystem:
             rho=float(self.config_obj.voi.rho),
         )
         return voi > float(next_agent_cost), voi
+
+    def _remaining_candidates_adaptive(
+        self,
+        *,
+        candidates: List[str],
+        queried: set[str],
+        source_agent: str,
+    ) -> List[str]:
+        remaining = [aid for aid in candidates if aid not in queried]
+        if not self.escalation_ordered:
+            return remaining
+        if source_agent not in candidates:
+            return remaining
+        source_idx = candidates.index(source_agent)
+        for aid in candidates[source_idx + 1 :]:
+            if aid not in queried:
+                return [aid]
+        return []
 
     def _build_payload(self, flow_id: str, timestamp: float, flow_features: Dict[str, Any], p_mal: float, uncertainty: float) -> Dict[str, Any]:
         return {
@@ -309,6 +337,7 @@ class IntegratedBAOSystem:
             "decision": None,
             "query_policy": self.query_policy,
             "fusion_method": self.fusion_method,
+            "routing_selection_modes": [],
         }
 
         queried_probabilities: Dict[str, float] = {}
@@ -362,36 +391,62 @@ class IntegratedBAOSystem:
 
                 while self.router is not None and len(state["agents_queried"]) < len(candidates):
                     queried = set(state["agents_queried"])
-                    remaining = [aid for aid in candidates if aid not in queried]
+                    source_agent = state["agents_queried"][-1] if state["agents_queried"] else last_agent
+                    remaining = self._remaining_candidates_adaptive(
+                        candidates=candidates,
+                        queried=queried,
+                        source_agent=source_agent,
+                    )
                     if not remaining:
                         break
 
-                    source_agent = state["agents_queried"][-1] if state["agents_queried"] else last_agent
-                    utilization_penalties = build_utilization_penalties(
+                    utilization_adjustments = build_utilization_adjustments(
                         candidate_agents=remaining,
                         agent_calls=self.metrics["agent_calls"],
                         flows_processed=int(self.metrics["flows_processed"]),
                         targets=self.utilization_targets,
                         warmup_flows=self.utilization_warmup_flows,
                     )
-                    next_agent, scores = self.router.select_next_agent(
+                    uncertainty = float(state["epistemic_uncertainty"])
+                    uncertainty_allows_exploration = uncertainty > float(self.exploration_uncertainty_threshold)
+                    if self.apply_uncertainty_gate_in_adaptive and uncertainty <= float(self.config_obj.query.uncertainty_threshold):
+                        if not self.force_under_target_topup:
+                            state["decision_reasoning"].append(
+                                f"adaptive_uncertainty_stop_after={source_agent},uncertainty={uncertainty:.6f},threshold={float(self.config_obj.query.uncertainty_threshold):.6f}"
+                            )
+                            self.metrics["routing_selection_counts"]["stop"] += 1
+                            break
+
+                    next_agent, scores, selection_mode = self.router.select_next_agent(
                         current_probability=float(state["compromise_prob"]),
                         source_agent=source_agent,
                         candidate_agents=remaining,
                         agent_handles=self.agent_handles,
                         belief_manager=self.belief_manager,
                         min_expected_gain=float(self.config_obj.query.min_expected_gain),
-                        utilization_penalties=utilization_penalties,
+                        utilization_adjustments=utilization_adjustments,
+                        exploration_enabled=self.exploration_enabled,
+                        exploration_base_rate=self.exploration_base_rate,
+                        exploration_max_rate=self.exploration_max_rate,
+                        force_under_target_topup=self.force_under_target_topup,
+                        uncertainty_allows_exploration=uncertainty_allows_exploration,
                     )
                     state["expected_gain_scores"][source_agent] = {
                         aid: score.to_dict() for aid, score in scores.items()
                     }
                     # Keep compatibility key for external consumers.
                     state["voi_scores"].update({aid: float(score.expected_gain) for aid, score in scores.items()})
+                    fallback_sources = [aid for aid, score in scores.items() if str(score.profile_source) == "fallback"]
+                    if fallback_sources:
+                        state["decision_reasoning"].append(f"adaptive_profile_fallback={','.join(fallback_sources)}")
+                    state["routing_selection_modes"].append(selection_mode)
+                    if selection_mode not in self.metrics["routing_selection_counts"]:
+                        self.metrics["routing_selection_counts"][selection_mode] = 0
+                    self.metrics["routing_selection_counts"][selection_mode] += 1
 
                     if next_agent is None:
                         state["decision_reasoning"].append(
-                            f"adaptive_stop_after={source_agent},min_expected_gain={float(self.config_obj.query.min_expected_gain):.6f}"
+                            f"adaptive_stop_after={source_agent},selection_mode={selection_mode},min_expected_gain={float(self.config_obj.query.min_expected_gain):.6f}"
                         )
                         break
 
@@ -476,6 +531,7 @@ class IntegratedBAOSystem:
             "agents_queried": state["agents_queried"],
             "voi_scores": state["voi_scores"],
             "expected_gain_scores": state["expected_gain_scores"],
+            "routing_selection_modes": state["routing_selection_modes"],
             "confidence": state["confidence"],
             "query_policy": self.query_policy,
             "fusion_method": self.fusion_method,
@@ -515,6 +571,12 @@ class IntegratedBAOSystem:
             agent_calls=self.metrics["agent_calls"],
             flows_processed=int(self.metrics["flows_processed"]),
         )
+        util_diagnostics = build_utilization_diagnostics(
+            agent_calls=self.metrics["agent_calls"],
+            flows_processed=int(self.metrics["flows_processed"]),
+            targets=self.utilization_targets,
+            warmup_flows=self.utilization_warmup_flows,
+        )
         return {
             "flows_processed": self.metrics["flows_processed"],
             "decision_counts": dict(self.metrics["decisions"]),
@@ -528,4 +590,6 @@ class IntegratedBAOSystem:
             "query_policy": self.query_policy,
             "fusion_method": self.fusion_method,
             "agent_utilization": util_rates,
+            "utilization_band_diagnostics": util_diagnostics,
+            "routing_selection_counts": dict(self.metrics["routing_selection_counts"]),
         }

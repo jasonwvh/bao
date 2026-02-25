@@ -6,7 +6,8 @@
 - **Optional engine:** LangGraph parity runtime (`orchestration.engine: langgraph`)
 - **Cheapest-first policy:** first queried agent is selected dynamically from healthy enabled agents when `orchestration.first_agent_strategy: dynamic_cheapest`
 - **Decision semantics:** `decision` is the classification output (`accept`/`reject` from posterior threshold), while `action_decision` is the expected-cost action used for utility accounting
-- **Routing objective:** expected gain with optional utilization penalties (`query.utilization_targets`) and warmup gating (`query.utilization_warmup_flows`)
+- **Routing objective:** expected gain with utilization-band adjustments (`query.utilization_targets`) + warmup gating (`query.utilization_warmup_flows`) + seeded exploration/top-up controls (`query.exploration_*`)
+- **Adaptive gate:** optional entropy gate in adaptive routing (`query.apply_uncertainty_gate_in_adaptive`) with ordered escalation (`query.escalation_ordered`)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐

@@ -4,7 +4,8 @@ import unittest
 
 from orchestrator.core import (
     UtilizationTarget,
-    build_utilization_penalties,
+    build_utilization_adjustments,
+    build_utilization_diagnostics,
     order_candidates,
     resolve_first_agent,
 )
@@ -48,18 +49,18 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(first, "a")
 
-    def test_utilization_penalty_warmup_and_bounds(self) -> None:
+    def test_utilization_adjustment_warmup_and_bounds(self) -> None:
         targets = {
             "b": UtilizationTarget(
                 agent_id="b",
                 min_rate=0.10,
                 max_rate=0.25,
-                penalty_under=2.0,
+                bonus_under=2.0,
                 penalty_over=3.0,
             )
         }
-        # During warmup there is no penalty.
-        p = build_utilization_penalties(
+        # During warmup there is no adjustment.
+        p = build_utilization_adjustments(
             candidate_agents=["b"],
             agent_calls={"b": 0},
             flows_processed=100,
@@ -68,8 +69,8 @@ class CoreTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(p["b"]), 0.0, places=12)
 
-        # Post-warmup under-utilization incurs penalty.
-        p = build_utilization_penalties(
+        # Post-warmup under-utilization adds positive adjustment.
+        p = build_utilization_adjustments(
             candidate_agents=["b"],
             agent_calls={"b": 0},
             flows_processed=1000,
@@ -78,8 +79,8 @@ class CoreTests(unittest.TestCase):
         )
         self.assertGreater(float(p["b"]), 0.0)
 
-        # Inside band gives no penalty.
-        p = build_utilization_penalties(
+        # Inside band gives no adjustment.
+        p = build_utilization_adjustments(
             candidate_agents=["b"],
             agent_calls={"b": 150},
             flows_processed=1000,
@@ -87,6 +88,36 @@ class CoreTests(unittest.TestCase):
             warmup_flows=500,
         )
         self.assertAlmostEqual(float(p["b"]), 0.0, places=12)
+
+        # Over-utilization gives negative adjustment.
+        p = build_utilization_adjustments(
+            candidate_agents=["b"],
+            agent_calls={"b": 400},
+            flows_processed=1000,
+            targets=targets,
+            warmup_flows=500,
+        )
+        self.assertLess(float(p["b"]), 0.0)
+
+    def test_utilization_diagnostics(self) -> None:
+        targets = {
+            "b": UtilizationTarget(
+                agent_id="b",
+                min_rate=0.10,
+                max_rate=0.25,
+                bonus_under=2.0,
+                penalty_over=3.0,
+            )
+        }
+        d = build_utilization_diagnostics(
+            agent_calls={"b": 50},
+            flows_processed=1000,
+            targets=targets,
+            warmup_flows=0,
+        )
+        self.assertIn("b", d)
+        self.assertGreater(float(d["b"]["under"]), 0.0)
+        self.assertGreater(float(d["b"]["adjustment"]), 0.0)
 
 
 if __name__ == "__main__":

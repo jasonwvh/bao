@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from orchestrator.core import UtilizationTarget, build_utilization_penalties, compute_utilization_rates
+from orchestrator.core import UtilizationTarget, build_utilization_adjustments, compute_utilization_rates
 from orchestrator.decision import DecisionCosts, min_expected_action_cost, realized_action_cost
 from orchestrator.config import load_orchestrator_config
 from orchestrator.control.registry import load_registry, to_runtime_handles
@@ -164,14 +164,14 @@ def _evaluate_costs(
             remaining = [a for a in available if a not in queried]
             if not remaining:
                 break
-            util_penalties = build_utilization_penalties(
+            util_adjustments = build_utilization_adjustments(
                 candidate_agents=remaining,
                 agent_calls=agent_query_counts,
                 flows_processed=int(flow_idx),
                 targets=utilization_targets,
                 warmup_flows=int(utilization_warmup_flows),
             )
-            next_agent, _scores = router.select_next_agent(
+            next_agent, _scores, _mode = router.select_next_agent(
                 current_probability=current_p,
                 source_agent=last_agent,
                 candidate_agents=remaining,
@@ -192,7 +192,9 @@ def _evaluate_costs(
                 },
                 belief_manager=belief,
                 min_expected_gain=min_expected_gain,
-                utilization_penalties=util_penalties,
+                utilization_adjustments=util_adjustments,
+                exploration_enabled=False,
+                force_under_target_topup=False,
             )
             if next_agent is None:
                 break
@@ -239,7 +241,7 @@ def _evaluate_costs(
         rate = float(utilization.get(aid, 0.0))
         under = max(0.0, float(target.min_rate) - rate)
         over = max(0.0, rate - float(target.max_rate))
-        weighted = (under * float(target.penalty_under)) + (over * float(target.penalty_over))
+        weighted = (under * float(target.bonus_under)) + (over * float(target.penalty_over))
         weighted_violation += weighted
         violation_detail[aid] = {
             "rate": rate,
@@ -307,13 +309,13 @@ def main() -> None:
         else float(cfg_model.decision.accuracy_floor_delta)
     )
     utilization_targets = {
-        t.agent_id: UtilizationTarget(
-            agent_id=t.agent_id,
-            min_rate=float(t.min_rate),
-            max_rate=float(t.max_rate),
-            penalty_under=float(t.penalty_under),
-            penalty_over=float(t.penalty_over),
-        )
+            t.agent_id: UtilizationTarget(
+                agent_id=t.agent_id,
+                min_rate=float(t.min_rate),
+                max_rate=float(t.max_rate),
+                bonus_under=float(t.bonus_under),
+                penalty_over=float(t.penalty_over),
+            )
         for t in cfg_model.query.utilization_targets
     }
     utilization_warmup_flows = int(cfg_model.query.utilization_warmup_flows)
@@ -442,7 +444,7 @@ def main() -> None:
             aid: {
                 "min_rate": float(t.min_rate),
                 "max_rate": float(t.max_rate),
-                "penalty_under": float(t.penalty_under),
+                "bonus_under": float(t.bonus_under),
                 "penalty_over": float(t.penalty_over),
             }
             for aid, t in utilization_targets.items()
@@ -483,7 +485,7 @@ def main() -> None:
                 "agent_id": aid,
                 "min_rate": float(t.min_rate),
                 "max_rate": float(t.max_rate),
-                "penalty_under": float(t.penalty_under),
+                "bonus_under": float(t.bonus_under),
                 "penalty_over": float(t.penalty_over),
             }
             for aid, t in utilization_targets.items()

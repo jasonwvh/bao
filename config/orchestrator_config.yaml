@@ -26,7 +26,7 @@ decision:
     c_h: 100.0
   accuracy_floor_delta: 0.01
   cost_calibration:
-    enabled: true
+    enabled: false
     mode: validation_derived
     fusion_method: handoff_latest
     c_fn_grid: [25.0, 50.0, 100.0, 200.0, 500.0]
@@ -38,21 +38,29 @@ decision:
 query:
   policy: adaptive_router
   first_agent: ocsvm
-  uncertainty_threshold: 0.646
+  uncertainty_threshold: 0.689
+  apply_uncertainty_gate_in_adaptive: true
   max_agents: 3
   min_expected_gain: 0.0
+  force_under_target_topup: true
+  exploration_enabled: true
+  exploration_seed: 7
+  exploration_base_rate: 0.002
+  exploration_max_rate: 0.08
+  exploration_uncertainty_threshold: 0.689
+  escalation_ordered: true
   utilization_warmup_flows: 500
   utilization_targets:
     - agent_id: lstm_autoencoder
-      min_rate: 0.10
-      max_rate: 0.25
-      penalty_under: 1.5
-      penalty_over: 1.0
+      min_rate: 0.08
+      max_rate: 0.15
+      bonus_under: 6.0
+      penalty_over: 8.0
     - agent_id: wgan_gp
-      min_rate: 0.01
-      max_rate: 0.05
-      penalty_under: 2.0
-      penalty_over: 2.5
+      min_rate: 0.005
+      max_rate: 0.02
+      bonus_under: 12.0
+      penalty_over: 16.0
 
 voi:
   enabled: false
