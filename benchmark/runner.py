@@ -18,6 +18,18 @@ MODEL_PATH_BY_AGENT = {
     "wgan_gp": Path("agents/wgan_gp/models/wgan_gp.pt"),
 }
 
+
+def label_to_decision(label: object) -> Optional[str]:
+    if label is None:
+        return None
+    x = str(label).strip().lower()
+    if x in {"malicious", "attack", "reject"}:
+        return "reject"
+    if x in {"benign", "clean", "accept"}:
+        return "accept"
+    return None
+
+
 def load_default_decision_costs(config_path: Optional[str | Path] = None) -> DecisionCosts:
     repo_root = Path(__file__).resolve().parents[1]
     cfg_path = Path(config_path).resolve() if config_path is not None else (repo_root / "config" / "orchestrator_config.yaml")

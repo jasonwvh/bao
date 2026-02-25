@@ -24,7 +24,14 @@ from benchmark.runner import (
     reset_sqlite_state,
     write_json,
 )
-from orchestrator.config import FUSION_METHODS, PREDICTION_SOURCES, QUERY_POLICIES, load_orchestrator_config
+from orchestrator.config import (
+    FIRST_AGENT_STRATEGIES,
+    FUSION_METHODS,
+    ORCHESTRATION_ENGINES,
+    PREDICTION_SOURCES,
+    QUERY_POLICIES,
+    load_orchestrator_config,
+)
 from orchestrator.data.replay import load_replay_dataset
 from orchestrator.decision import DecisionCosts
 from orchestrator.integrated_system import IntegratedBAOSystem
@@ -62,6 +69,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override orchestration update mode",
     )
+    p.add_argument("--engine", choices=sorted(ORCHESTRATION_ENGINES), default=None, help="Override orchestration.engine")
+    p.add_argument(
+        "--first-agent-strategy",
+        choices=sorted(FIRST_AGENT_STRATEGIES),
+        default=None,
+        help="Override orchestration.first_agent_strategy",
+    )
     p.add_argument("--cost-calibration-json", default=None, help="Optional JSON with calibrated c_fn/c_fp/c_h")
     p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default=None)
     p.add_argument("--diagnostic-dataset", default=None, help="Optional secondary replay dataset")
@@ -83,6 +97,10 @@ def _apply_overrides(raw_config: Dict[str, Any], args: argparse.Namespace) -> Di
     orch["seed"] = int(args.seed)
     if args.update_mode is not None:
         orch["update_mode"] = str(args.update_mode)
+    if args.engine is not None:
+        orch["engine"] = str(args.engine)
+    if args.first_agent_strategy is not None:
+        orch["first_agent_strategy"] = str(args.first_agent_strategy)
     if args.agent_sequence is not None:
         orch["agent_sequence"] = [x.strip() for x in str(args.agent_sequence).split(",") if x.strip()]
     cfg["orchestration"] = orch

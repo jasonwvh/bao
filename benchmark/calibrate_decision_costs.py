@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from orchestrator.core import UtilizationTarget, build_utilization_penalties, compute_utilization_rates
 from orchestrator.decision import DecisionCosts, min_expected_action_cost, realized_action_cost
 from orchestrator.config import load_orchestrator_config
 from orchestrator.control.registry import load_registry, to_runtime_handles
@@ -100,6 +101,9 @@ class EvalResult:
     utility_cost_per_flow: float
     query_cost_per_flow: float
     action_cost_per_flow: float
+    utilization: Dict[str, float]
+    utilization_weighted_violation: float
+    utilization_violation_detail: Dict[str, Dict[str, float]]
 
 
 @dataclass
@@ -123,6 +127,8 @@ def _evaluate_costs(
     agent_costs: Dict[str, float],
     reliability: Dict[str, float],
     profile_path: Path,
+    utilization_targets: Dict[str, UtilizationTarget],
+    utilization_warmup_flows: int,
 ) -> EvalResult:
     router = AdaptiveRouter(
         decision_costs=costs,
@@ -134,9 +140,10 @@ def _evaluate_costs(
     total_correct = 0
     total_query_cost = 0.0
     total_action_cost = 0.0
+    agent_query_counts: Dict[str, int] = {aid: 0 for aid in sequence}
 
     ordered = [first_agent] + [a for a in sequence if a != first_agent]
-    for fid in common_flow_ids:
+    for flow_idx, fid in enumerate(common_flow_ids):
         available = [a for a in ordered if a in rows_by_agent]
         if not available:
             continue
@@ -151,11 +158,19 @@ def _evaluate_costs(
         queried_probs[first] = current_p
         query_cost = float(agent_costs[first])
         last_agent = first
+        agent_query_counts[first] = int(agent_query_counts.get(first, 0)) + 1
 
         while len(queried) < min(max_agents, len(available)):
             remaining = [a for a in available if a not in queried]
             if not remaining:
                 break
+            util_penalties = build_utilization_penalties(
+                candidate_agents=remaining,
+                agent_calls=agent_query_counts,
+                flows_processed=int(flow_idx),
+                targets=utilization_targets,
+                warmup_flows=int(utilization_warmup_flows),
+            )
             next_agent, _scores = router.select_next_agent(
                 current_probability=current_p,
                 source_agent=last_agent,
@@ -177,6 +192,7 @@ def _evaluate_costs(
                 },
                 belief_manager=belief,
                 min_expected_gain=min_expected_gain,
+                utilization_penalties=util_penalties,
             )
             if next_agent is None:
                 break
@@ -186,6 +202,7 @@ def _evaluate_costs(
             queried_probs[next_agent] = float(row["probability"])
             query_cost += float(agent_costs[next_agent])
             last_agent = next_agent
+            agent_query_counts[next_agent] = int(agent_query_counts.get(next_agent, 0)) + 1
 
             if fusion_method == "handoff_latest":
                 current_p = queried_probs[next_agent]
@@ -215,11 +232,32 @@ def _evaluate_costs(
         )
 
     n = max(1, len(common_flow_ids))
+    utilization = compute_utilization_rates(agent_calls=agent_query_counts, flows_processed=n)
+    violation_detail: Dict[str, Dict[str, float]] = {}
+    weighted_violation = 0.0
+    for aid, target in utilization_targets.items():
+        rate = float(utilization.get(aid, 0.0))
+        under = max(0.0, float(target.min_rate) - rate)
+        over = max(0.0, rate - float(target.max_rate))
+        weighted = (under * float(target.penalty_under)) + (over * float(target.penalty_over))
+        weighted_violation += weighted
+        violation_detail[aid] = {
+            "rate": rate,
+            "min_rate": float(target.min_rate),
+            "max_rate": float(target.max_rate),
+            "under": under,
+            "over": over,
+            "weighted": weighted,
+        }
+
     return EvalResult(
         accuracy=total_correct / n,
         query_cost_per_flow=total_query_cost / n,
         action_cost_per_flow=total_action_cost / n,
         utility_cost_per_flow=(total_query_cost + total_action_cost) / n,
+        utilization=utilization,
+        utilization_weighted_violation=weighted_violation,
+        utilization_violation_detail=violation_detail,
     )
 
 
@@ -242,7 +280,15 @@ def main() -> None:
     else:
         sequence = [a.strip() for a in str(args.agents).split(",") if a.strip()]
 
-    first_agent = str(args.first_agent if args.first_agent is not None else (cfg_model.query.first_agent or sequence[0])).strip()
+    if args.first_agent is not None:
+        first_agent = str(args.first_agent).strip()
+    elif cfg_model.orchestration.first_agent_strategy == "dynamic_cheapest":
+        first_agent = min(
+            sequence,
+            key=lambda aid: float(handles.get(aid).cost) if aid in handles else float("inf"),
+        )
+    else:
+        first_agent = str(cfg_model.query.first_agent or sequence[0]).strip()
     if first_agent not in sequence:
         sequence = [first_agent] + sequence
 
@@ -260,6 +306,17 @@ def main() -> None:
         if args.accuracy_floor_delta is not None
         else float(cfg_model.decision.accuracy_floor_delta)
     )
+    utilization_targets = {
+        t.agent_id: UtilizationTarget(
+            agent_id=t.agent_id,
+            min_rate=float(t.min_rate),
+            max_rate=float(t.max_rate),
+            penalty_under=float(t.penalty_under),
+            penalty_over=float(t.penalty_over),
+        )
+        for t in cfg_model.query.utilization_targets
+    }
+    utilization_warmup_flows = int(cfg_model.query.utilization_warmup_flows)
 
     rows_by_agent: Dict[str, Dict[str, Dict]] = {}
     agent_costs: Dict[str, float] = {aid: float(handle.cost) for aid, handle in handles.items()}
@@ -339,6 +396,8 @@ def main() -> None:
                             agent_costs=agent_costs,
                             reliability=reliability,
                             profile_path=profile_path,
+                            utilization_targets=utilization_targets,
+                            utilization_warmup_flows=utilization_warmup_flows,
                         )
                         candidates.append(
                             Candidate(
@@ -351,7 +410,14 @@ def main() -> None:
 
     valid = [c for c in candidates if c.result.accuracy >= floor]
     if valid:
-        best = min(valid, key=lambda x: x.result.utility_cost_per_flow)
+        best = min(
+            valid,
+            key=lambda x: (
+                x.result.utility_cost_per_flow + x.result.utilization_weighted_violation,
+                x.result.utility_cost_per_flow,
+                x.result.utilization_weighted_violation,
+            ),
+        )
         selection_reason = "min_utility_with_accuracy_floor"
     else:
         best = max(candidates, key=lambda x: x.result.accuracy)
@@ -371,11 +437,24 @@ def main() -> None:
         "c_h": best_costs.c_h,
         "selected_max_agents": best.max_agents,
         "selected_min_expected_gain": best.min_expected_gain,
+        "utilization_warmup_flows": utilization_warmup_flows,
+        "utilization_targets": {
+            aid: {
+                "min_rate": float(t.min_rate),
+                "max_rate": float(t.max_rate),
+                "penalty_under": float(t.penalty_under),
+                "penalty_over": float(t.penalty_over),
+            }
+            for aid, t in utilization_targets.items()
+        },
         "result": {
             "accuracy": best_result.accuracy,
             "query_cost_per_flow": best_result.query_cost_per_flow,
             "action_cost_per_flow": best_result.action_cost_per_flow,
             "utility_cost_per_flow": best_result.utility_cost_per_flow,
+            "utilization": best_result.utilization,
+            "utilization_weighted_violation": best_result.utilization_weighted_violation,
+            "utilization_violation_detail": best_result.utilization_violation_detail,
         },
     }
     output_json.write_text(json.dumps(payload, indent=2))
@@ -397,6 +476,18 @@ def main() -> None:
     query["first_agent"] = first_agent
     query["max_agents"] = int(best.max_agents)
     query["min_expected_gain"] = float(best.min_expected_gain)
+    query["utilization_warmup_flows"] = int(utilization_warmup_flows)
+    if "utilization_targets" not in query:
+        query["utilization_targets"] = [
+            {
+                "agent_id": aid,
+                "min_rate": float(t.min_rate),
+                "max_rate": float(t.max_rate),
+                "penalty_under": float(t.penalty_under),
+                "penalty_over": float(t.penalty_over),
+            }
+            for aid, t in utilization_targets.items()
+        ]
     cfg["query"] = query
 
     fusion = dict(cfg.get("fusion", {}) or {})

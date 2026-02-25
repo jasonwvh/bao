@@ -44,8 +44,10 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
         query_policy: str = "strict_cascade",
         fusion_method: str = "logit_pool",
         first_agent: str | None = None,
+        first_agent_strategy: str = "explicit",
         min_expected_gain: float = 0.0,
         profile_path: str | None = None,
+        costs: Dict[str, float] | None = None,
     ) -> Path:
         ids = list(dict.fromkeys(sequence or ["agent_a", "agent_b"]))
         if len(ids) < 2:
@@ -60,7 +62,7 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
                     "endpoint": f"http://example-{aid}",
                     "transport": "http-json",
                     "timeout_ms": 1000,
-                    "cost": 1.0,
+                    "cost": float((costs or {}).get(aid, 1.0)),
                     "capabilities": ["flow_tabular"],
                     "health_path": "/a2a/health",
                     "infer_path": "/a2a/infer",
@@ -85,6 +87,8 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
                 "seed": 7,
                 "agent_registry_path": str(registry_path),
                 "update_mode": "posterior_first",
+                "engine": "deterministic",
+                "first_agent_strategy": first_agent_strategy,
                 "agent_sequence": sequence,
             },
             "belief": {
@@ -105,6 +109,8 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
                 "max_agents": max_agents,
                 "min_expected_gain": min_expected_gain,
                 "first_agent": first_agent,
+                "utilization_targets": [],
+                "utilization_warmup_flows": 500,
             },
             "voi": {"enabled": False, "rho": 0.7},
             "routing": {
@@ -112,6 +118,8 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
                 "bin_count": 20,
                 "min_samples_per_bin": 1,
                 "tie_break": "agent_sequence",
+                "langgraph_perf_guardrail_overhead": 0.05,
+                "parity_tolerance": 1e-6,
             },
             "benchmark": {"reset_state": True, "prediction_source": "probability", "write_manifest": False},
             "a2a": {"retries": 0},
@@ -203,6 +211,31 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(fake.calls[0], "agent_a")
             self.assertEqual(res["agents_queried"][0], "agent_a")
+
+    async def test_dynamic_cheapest_first_agent_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sequence = ["agent_a", "agent_b", "agent_c"]
+            cfg_path = self._write_files(
+                Path(td),
+                sequence=sequence,
+                max_agents=1,
+                first_agent=None,
+                first_agent_strategy="dynamic_cheapest",
+                costs={"agent_a": 3.0, "agent_b": 1.0, "agent_c": 5.0},
+            )
+            system = IntegratedBAOSystem(cfg_path)
+            fake = _FakeA2A({"agent_a": [0.9], "agent_b": [0.4], "agent_c": [0.7]})
+            system.a2a = fake
+
+            res = await system.process_flow(
+                flow_features={"packet_count": 10.0},
+                flow_id="flow-cheapest-first",
+                timestamp=time.time(),
+                true_label=0,
+            )
+
+            self.assertEqual(fake.calls[0], "agent_b")
+            self.assertEqual(res["agents_queried"][0], "agent_b")
 
     async def test_adaptive_router_selects_positive_gain_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as td:

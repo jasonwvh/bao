@@ -18,6 +18,7 @@ from benchmark.runner import (
     build_benchmark_manifest,
     dataset_composition,
     infer_prediction,
+    label_to_decision,
     write_json,
 )
 from orchestrator.config import PREDICTION_SOURCES, load_orchestrator_config
@@ -56,17 +57,6 @@ def _build_payload(row: dict) -> dict:
             "seed": 7,
         },
     }
-
-
-def _label_to_decision(label: object) -> str | None:
-    if label is None:
-        return None
-    x = str(label).strip().lower()
-    if x in {"malicious", "attack", "reject"}:
-        return "reject"
-    if x in {"benign", "clean", "accept"}:
-        return "accept"
-    return None
 
 
 def main() -> None:
@@ -109,7 +99,7 @@ def main() -> None:
         p_mal = max(1e-6, min(1.0 - 1e-6, float((output.get("proba") or [0.5, 0.5])[1])))
 
         label_hint = (output.get("prediction") or {}).get("label")
-        decision = _label_to_decision(label_hint)
+        decision = label_to_decision(label_hint)
         acc.add_sample(
             true_label=int(true_label),
             probability=p_mal,

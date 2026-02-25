@@ -24,10 +24,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="config/orchestrator_config.yaml", help="Orchestrator config path")
     p.add_argument("--output-root", default="artifacts/replay/matrix", help="Output root directory")
     p.add_argument("--max-flows", type=int, default=0, help="Limit number of flows (0=all)")
-    p.add_argument("--prediction-source", choices=["decision", "probability"], default="probability")
+    p.add_argument("--prediction-source", choices=["decision", "probability"], default="decision")
     p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--build-profile", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--calibrate-costs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--compare-engines", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--router-profile", default=None, help="Router profile output path")
     p.add_argument("--calibration-json", default=None, help="Cost calibration output JSON")
     p.add_argument("--calibrated-config", default=None, help="Calibrated orchestrator config output path")
@@ -192,6 +193,22 @@ def main() -> None:
             *max_flows_args,
         ]
     )
+
+    if args.compare_engines:
+        _run(
+            [
+                sys.executable,
+                "benchmark/compare_engines.py",
+                "--dataset",
+                args.dataset,
+                "--config",
+                str(calibrated_config),
+                "--max-flows",
+                str(int(args.max_flows) if int(args.max_flows or 0) > 0 else 2000),
+                "--output-json",
+                str(out_root / "engine_compare.json"),
+            ]
+        )
 
     summary = {
         "ocsvm": _load_json(out_root / "ocsvm" / "benchmark_ocsvm.json"),

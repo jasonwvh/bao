@@ -14,6 +14,8 @@ QUERY_POLICIES = {"strict_cascade", "adaptive_router"}
 ROUTING_TIE_BREAKS = {"agent_sequence"}
 CALIBRATION_MODES = {"validation_derived"}
 PREDICTION_SOURCES = {"decision", "probability"}
+ORCHESTRATION_ENGINES = {"deterministic", "langgraph"}
+FIRST_AGENT_STRATEGIES = {"dynamic_cheapest", "explicit"}
 logger = logging.getLogger("orchestrator.config")
 
 
@@ -23,6 +25,8 @@ class OrchestrationConfig:
     agent_registry_path: Path
     update_mode: str
     agent_sequence: list[str]
+    engine: str
+    first_agent_strategy: str
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,8 @@ class QueryConfig:
     max_agents: int
     min_expected_gain: float
     first_agent: Optional[str]
+    utilization_targets: list["UtilizationTargetConfig"]
+    utilization_warmup_flows: int
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,17 @@ class RoutingConfig:
     bin_count: int
     min_samples_per_bin: int
     tie_break: str
+    langgraph_perf_guardrail_overhead: float
+    parity_tolerance: float
+
+
+@dataclass(frozen=True)
+class UtilizationTargetConfig:
+    agent_id: str
+    min_rate: float
+    max_rate: float
+    penalty_under: float
+    penalty_over: float
 
 
 @dataclass(frozen=True)
@@ -201,6 +218,32 @@ def _as_list_of_int(value: Any) -> list[int]:
     return out
 
 
+def _as_utilization_targets(value: Any) -> list[UtilizationTargetConfig]:
+    if not isinstance(value, list):
+        return []
+    out: list[UtilizationTargetConfig] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        agent_id = str(item.get("agent_id", "")).strip()
+        if not agent_id:
+            continue
+        min_rate = _to_float(item.get("min_rate", 0.0), 0.0)
+        max_rate = _to_float(item.get("max_rate", 1.0), 1.0)
+        if max_rate < min_rate:
+            min_rate, max_rate = max_rate, min_rate
+        out.append(
+            UtilizationTargetConfig(
+                agent_id=agent_id,
+                min_rate=max(0.0, min(1.0, min_rate)),
+                max_rate=max(0.0, min(1.0, max_rate)),
+                penalty_under=max(0.0, _to_float(item.get("penalty_under", 0.0), 0.0)),
+                penalty_over=max(0.0, _to_float(item.get("penalty_over", 0.0), 0.0)),
+            )
+        )
+    return out
+
+
 def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     cfg_path = Path(path).resolve()
     raw = yaml.safe_load(cfg_path.read_text()) or {}
@@ -229,6 +272,9 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     update_mode = str(orch_raw.get("update_mode", "posterior_first")).strip().lower()
     if update_mode not in UPDATE_MODES:
         raise ValueError(f"unsupported orchestration.update_mode={update_mode!r}")
+    engine = str(orch_raw.get("engine", "deterministic")).strip().lower()
+    if engine not in ORCHESTRATION_ENGINES:
+        raise ValueError(f"unsupported orchestration.engine={engine!r}")
 
     fusion_method = str(fusion_raw.get("method", "logit_pool")).strip().lower()
     if fusion_method not in FUSION_METHODS:
@@ -271,6 +317,23 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     first_agent_value = query_raw.get("first_agent", "")
     first_agent_raw = "" if first_agent_value is None else str(first_agent_value).strip()
     first_agent = first_agent_raw if first_agent_raw else None
+    first_agent_strategy_raw = orch_raw.get("first_agent_strategy")
+    if first_agent_strategy_raw is None:
+        if first_agent is not None:
+            first_agent_strategy = "explicit"
+            logger.warning(
+                "query.first_agent is set but orchestration.first_agent_strategy is missing; "
+                "defaulting to 'explicit' for backward compatibility"
+            )
+        else:
+            first_agent_strategy = "dynamic_cheapest"
+    else:
+        first_agent_strategy = str(first_agent_strategy_raw).strip().lower()
+    if first_agent_strategy not in FIRST_AGENT_STRATEGIES:
+        raise ValueError(f"unsupported orchestration.first_agent_strategy={first_agent_strategy!r}")
+
+    utilization_targets = _as_utilization_targets(query_raw.get("utilization_targets", []))
+    utilization_warmup_flows = max(0, _to_int(query_raw.get("utilization_warmup_flows", 500), 500))
 
     weights_raw = fusion_raw.get("agent_weights", {})
     weights: Dict[str, float] = {}
@@ -307,6 +370,13 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     tie_break = str(routing_raw.get("tie_break", "agent_sequence")).strip().lower()
     if tie_break not in ROUTING_TIE_BREAKS:
         raise ValueError(f"unsupported routing.tie_break={tie_break!r}")
+    langgraph_perf_guardrail_overhead = _to_float(
+        routing_raw.get("langgraph_perf_guardrail_overhead", 0.05),
+        0.05,
+    )
+    langgraph_perf_guardrail_overhead = max(0.0, min(1.0, langgraph_perf_guardrail_overhead))
+    parity_tolerance = _to_float(routing_raw.get("parity_tolerance", 1e-6), 1e-6)
+    parity_tolerance = max(0.0, parity_tolerance)
 
     state_path = _resolve_path(base_dir, state_raw.get("sqlite_path"), "../artifacts/state/bao_state.sqlite")
     jsonl_path = _resolve_path(base_dir, logging_raw.get("jsonl_path"), "../artifacts/replay/flows.jsonl")
@@ -323,6 +393,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             agent_registry_path=registry_path,
             update_mode=update_mode,
             agent_sequence=_as_list_of_str(orch_raw.get("agent_sequence", [])),
+            engine=engine,
+            first_agent_strategy=first_agent_strategy,
         ),
         belief=BeliefConfig(
             prior_attack_rate=prior,
@@ -353,6 +425,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             max_agents=max_agents,
             min_expected_gain=min_expected_gain,
             first_agent=first_agent,
+            utilization_targets=utilization_targets,
+            utilization_warmup_flows=utilization_warmup_flows,
         ),
         voi=VOIConfig(
             enabled=_to_bool(voi_raw.get("enabled", True), True),
@@ -363,6 +437,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             bin_count=max(2, _to_int(routing_raw.get("bin_count", 20), 20)),
             min_samples_per_bin=max(1, _to_int(routing_raw.get("min_samples_per_bin", 20), 20)),
             tie_break=tie_break,
+            langgraph_perf_guardrail_overhead=langgraph_perf_guardrail_overhead,
+            parity_tolerance=parity_tolerance,
         ),
         benchmark=BenchmarkConfig(
             reset_state=_to_bool(benchmark_raw.get("reset_state", True), True),

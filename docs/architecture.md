@@ -1,4 +1,12 @@
-# Bayesian Agent Orchestrator (BAO) — System Architecture v2
+# Bayesian Agent Orchestrator (BAO) — System Architecture v5
+
+## Runtime truth (current implementation)
+
+- **Default engine:** deterministic orchestrator loop (`orchestration.engine: deterministic`)
+- **Optional engine:** LangGraph parity runtime (`orchestration.engine: langgraph`)
+- **Cheapest-first policy:** first queried agent is selected dynamically from healthy enabled agents when `orchestration.first_agent_strategy: dynamic_cheapest`
+- **Decision semantics:** `decision` is the classification output (`accept`/`reject` from posterior threshold), while `action_decision` is the expected-cost action used for utility accounting
+- **Routing objective:** expected gain with optional utilization penalties (`query.utilization_targets`) and warmup gating (`query.utilization_warmup_flows`)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -143,7 +151,7 @@
 
 ## Framework Roles
 
-**LangGraph** governs the entire orchestration layer as a stateful directed graph. Each major component is a node holding a slice of the shared graph state (current belief, evidence collected, cost parameters, uncertainty estimates). Routing between components is implemented as conditional edges — for example, the VOI Router branches to a detector or directly to the Decision Node, and the Decision Node branches to Actions or HITL depending on the outcome. The graph execution naturally pauses at the HITL node and resumes when analyst input arrives, which is a native LangGraph capability. This makes the full decision trace — every node visited, every state transition — inspectable and auditable.
+**LangGraph** is an optional runtime for orchestration parity and inspection. The deterministic runtime is production default for performance. Both engines execute the same policy math and share config/state/A2A contracts; parity and performance guardrails determine whether LangGraph can be promoted.
 
 **A2A Protocol** governs lateral communication between detector agents, independently of the main orchestration graph. Each agent advertises its capabilities (input modality, cost, uncertainty type) and exposes an endpoint through which it can share intermediate evidence, flag anomalies, or participate in consensus on ambiguous flows. The communication bus mediates this without routing through the orchestrator, keeping inter-agent coordination decoupled from the main belief update cycle.
 
@@ -153,10 +161,10 @@
 
 ## Key Architectural Properties
 
-**State continuity** — LangGraph maintains a single shared state object across all nodes. Every belief update, VOI computation, and calibration change is recorded in this state, giving full decision provenance without additional logging infrastructure.
+**State continuity** — The shared state backend maintains belief and reliability continuity independent of engine choice. Every belief update, routing decision, and calibration change is persisted with reproducible replay traces.
 
 **Decoupled coordination** — A2A communication between agents does not pass through the orchestrator. This means agents can share evidence asynchronously without blocking the main graph execution or coupling agent internals to the orchestration logic.
 
-**Auditable human integration** — The HITL node is a formal interrupt in the LangGraph execution flow, not a side channel. The graph cannot proceed past deferral without an analyst response, making human oversight architecturally enforced rather than optional.
+**Auditable human integration** — Deferral and action decisions are explicit (`decision` vs `action_decision`) and logged per flow, so predictive quality and utility costs are auditable independently.
 
 **Feedback as graph re-entry** — Analyst signals processed by the Feedback Integrator update the shared graph state (reliability estimates, cost distributions, deferral thresholds), meaning subsequent flows through the graph automatically reflect accumulated human feedback without requiring explicit retraining cycles.

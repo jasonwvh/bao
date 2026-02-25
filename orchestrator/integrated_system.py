@@ -16,10 +16,19 @@ from orchestrator.data_plane.state_sqlite import SQLiteStateBackend
 from orchestrator.decision import (
     DecisionCosts,
     approximate_voi,
-    min_expected_action_cost,
     realized_action_cost,
     select_expected_cost_action,
 )
+from orchestrator.core import (
+    UtilizationTarget,
+    apply_fusion_update,
+    build_utilization_penalties,
+    classify_from_probability,
+    compute_utilization_rates,
+    order_candidates,
+    resolve_first_agent,
+)
+from orchestrator.langgraph_runtime import LangGraphRuntime
 from orchestrator.preprocessing import OrchestratorPreprocessor
 from orchestrator.router import AdaptiveRouter
 
@@ -27,7 +36,7 @@ logger = logging.getLogger("orchestrator")
 
 
 class IntegratedBAOSystem:
-    """Deterministic BAO runtime with config-driven query policy and fusion."""
+    """Config-driven BAO runtime with deterministic default and optional LangGraph engine."""
 
     def __init__(self, config_path: str | Path):
         self.config_obj: OrchestratorConfig = load_orchestrator_config(config_path)
@@ -71,6 +80,7 @@ class IntegratedBAOSystem:
 
         self.query_policy = self.config_obj.query.policy
         self.fusion_method = self.config_obj.fusion.method
+        self.engine = self.config_obj.orchestration.engine
         self.router: Optional[AdaptiveRouter] = None
         if self.query_policy == "adaptive_router":
             self.router = AdaptiveRouter(
@@ -78,6 +88,21 @@ class IntegratedBAOSystem:
                 profile_path=self.config_obj.routing.profile_path,
                 min_samples_per_bin=int(self.config_obj.routing.min_samples_per_bin),
             )
+        self.langgraph_runtime: Optional[LangGraphRuntime] = None
+        if self.engine == "langgraph":
+            self.langgraph_runtime = LangGraphRuntime(self)
+
+        self.utilization_targets = {
+            t.agent_id: UtilizationTarget(
+                agent_id=t.agent_id,
+                min_rate=float(t.min_rate),
+                max_rate=float(t.max_rate),
+                penalty_under=float(t.penalty_under),
+                penalty_over=float(t.penalty_over),
+            )
+            for t in self.config_obj.query.utilization_targets
+        }
+        self.utilization_warmup_flows = int(self.config_obj.query.utilization_warmup_flows)
 
         self.metrics = {
             "flows_processed": 0,
@@ -129,17 +154,15 @@ class IntegratedBAOSystem:
     def _candidate_agents(self, flow_features: Dict[str, Any]) -> List[str]:
         required_caps = list(flow_features.get("required_capabilities", []))
         candidates = filter_by_capability(self.agent_sequence, self.agent_handles, required_caps)
-        first_agent = self.config_obj.query.first_agent
-        if first_agent is not None and first_agent in candidates:
-            candidates = [first_agent] + [aid for aid in candidates if aid != first_agent]
-        max_agents = min(int(self.config_obj.query.max_agents), len(candidates))
-        return candidates[:max_agents]
-
-    def _ordered_candidates(self, candidates: List[str]) -> List[str]:
-        first_agent = self.config_obj.query.first_agent
-        if first_agent is None or first_agent not in candidates:
-            return candidates
-        return [first_agent] + [aid for aid in candidates if aid != first_agent]
+        first_agent = resolve_first_agent(
+            candidates=list(candidates),
+            agent_handles=self.agent_handles,
+            strategy=self.config_obj.orchestration.first_agent_strategy,
+            explicit_first_agent=self.config_obj.query.first_agent,
+        )
+        ordered = order_candidates(candidates, first_agent)
+        max_agents = min(int(self.config_obj.query.max_agents), len(ordered))
+        return ordered[:max_agents]
 
     def _query_decision_strict(
         self,
@@ -181,60 +204,6 @@ class IntegratedBAOSystem:
         eps = self.config_obj.belief.eps
         return max(eps, min(1.0 - eps, p))
 
-    def _apply_fusion_update(
-        self,
-        *,
-        belief: Any,
-        agent_output: Dict[str, Any],
-        agent_id: str,
-        p_agent: float,
-        queried_probabilities: Dict[str, float],
-    ) -> Tuple[Dict[str, float], str]:
-        if self.fusion_method == "logit_pool":
-            weight = self._agent_weight(agent_id)
-            updated = belief.update_from_agent_output(
-                agent_output=agent_output,
-                agent_id=agent_id,
-                update_mode=self.config_obj.orchestration.update_mode,
-                weight=weight,
-                eps=self.config_obj.belief.eps,
-                likelihood_sanity_gate=self.config_obj.belief.likelihood_sanity_gate,
-            )
-            return updated, "logit_pool"
-
-        if self.fusion_method == "handoff_latest":
-            weight = self._agent_weight(agent_id)
-            belief.set_compromise_prob(p_agent)
-            belief.var = max(1e-4, min(4.0, 1.0 / max(weight, self.config_obj.belief.eps)))
-            return {
-                "mu": belief.mu,
-                "var": belief.get_variance(),
-                "compromise_prob": belief.get_compromise_prob(),
-                "epistemic_uncertainty": belief.get_epistemic_uncertainty(),
-            }, "handoff_latest"
-
-        # utility_select
-        queried_probabilities[agent_id] = p_agent
-        best_agent = agent_id
-        best_proxy = float("inf")
-        best_prob = p_agent
-        for aid, p in queried_probabilities.items():
-            reliability = max(self.config_obj.belief.eps, float(self.belief_manager.get_global_reliability(aid)))
-            proxy_cost = min_expected_action_cost(p, self.decision_costs) / reliability
-            if proxy_cost < best_proxy:
-                best_proxy = proxy_cost
-                best_agent = aid
-                best_prob = p
-
-        belief.set_compromise_prob(best_prob)
-        belief.var = max(1e-4, min(4.0, 1.0 / max(self._agent_weight(best_agent), self.config_obj.belief.eps)))
-        return {
-            "mu": belief.mu,
-            "var": belief.get_variance(),
-            "compromise_prob": belief.get_compromise_prob(),
-            "epistemic_uncertainty": belief.get_epistemic_uncertainty(),
-        }, f"utility_select:{best_agent}"
-
     def _query_single_agent(
         self,
         *,
@@ -264,12 +233,19 @@ class IntegratedBAOSystem:
         p_agent = self._clip_probability((output.get("proba") or [0.5, 0.5])[1])
         output["proba"] = [1.0 - p_agent, p_agent]
 
-        updated, fusion_note = self._apply_fusion_update(
+        updated, fusion_note = apply_fusion_update(
             belief=belief,
+            belief_manager=self.belief_manager,
             agent_output=output,
             agent_id=aid,
             p_agent=p_agent,
             queried_probabilities=queried_probabilities,
+            fusion_method=self.fusion_method,
+            update_mode=self.config_obj.orchestration.update_mode,
+            agent_weight=self._agent_weight(aid),
+            eps=self.config_obj.belief.eps,
+            likelihood_sanity_gate=self.config_obj.belief.likelihood_sanity_gate,
+            decision_costs=self.decision_costs,
         )
 
         state["agents_queried"].append(aid)
@@ -288,7 +264,7 @@ class IntegratedBAOSystem:
         )
         return True
 
-    async def process_flow(
+    async def _process_flow_deterministic(
         self,
         flow_features: Dict[str, Any],
         flow_id: str,
@@ -298,7 +274,7 @@ class IntegratedBAOSystem:
         t0 = time.perf_counter()
         features = dict(flow_features)
 
-        candidates = self._ordered_candidates(self._candidate_agents(features))
+        candidates = self._candidate_agents(features)
         belief = self.belief_manager.get_or_create_belief(
             flow_id=flow_id,
             prior_attack_rate=self.config_obj.belief.prior_attack_rate,
@@ -391,6 +367,13 @@ class IntegratedBAOSystem:
                         break
 
                     source_agent = state["agents_queried"][-1] if state["agents_queried"] else last_agent
+                    utilization_penalties = build_utilization_penalties(
+                        candidate_agents=remaining,
+                        agent_calls=self.metrics["agent_calls"],
+                        flows_processed=int(self.metrics["flows_processed"]),
+                        targets=self.utilization_targets,
+                        warmup_flows=self.utilization_warmup_flows,
+                    )
                     next_agent, scores = self.router.select_next_agent(
                         current_probability=float(state["compromise_prob"]),
                         source_agent=source_agent,
@@ -398,6 +381,7 @@ class IntegratedBAOSystem:
                         agent_handles=self.agent_handles,
                         belief_manager=self.belief_manager,
                         min_expected_gain=float(self.config_obj.query.min_expected_gain),
+                        utilization_penalties=utilization_penalties,
                     )
                     state["expected_gain_scores"][source_agent] = {
                         aid: score.to_dict() for aid, score in scores.items()
@@ -429,7 +413,7 @@ class IntegratedBAOSystem:
 
         final_p = float(belief.get_compromise_prob())
         action_decision, action_costs = select_expected_cost_action(final_p, self.decision_costs)
-        classification_decision = "reject" if final_p >= 0.5 else "accept"
+        classification_decision = classify_from_probability(final_p)
 
         state["decision"] = classification_decision
         state["action_decision"] = action_decision
@@ -501,11 +485,36 @@ class IntegratedBAOSystem:
 
         return state
 
+    async def process_flow(
+        self,
+        flow_features: Dict[str, Any],
+        flow_id: str,
+        timestamp: float,
+        true_label: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if self.engine == "langgraph" and self.langgraph_runtime is not None:
+            return await self.langgraph_runtime.process_flow(
+                flow_features=flow_features,
+                flow_id=flow_id,
+                timestamp=timestamp,
+                true_label=true_label,
+            )
+        return await self._process_flow_deterministic(
+            flow_features=flow_features,
+            flow_id=flow_id,
+            timestamp=timestamp,
+            true_label=true_label,
+        )
+
     def get_system_statistics(self) -> Dict[str, Any]:
         n = max(1, self.metrics["flows_processed"])
         query_total = float(self.metrics["total_query_cost"])
         action_total = float(self.metrics["total_action_cost"])
         utility_total = float(self.metrics["total_utility_cost"])
+        util_rates = compute_utilization_rates(
+            agent_calls=self.metrics["agent_calls"],
+            flows_processed=int(self.metrics["flows_processed"]),
+        )
         return {
             "flows_processed": self.metrics["flows_processed"],
             "decision_counts": dict(self.metrics["decisions"]),
@@ -518,5 +527,5 @@ class IntegratedBAOSystem:
             "hitl_count": self.metrics["hitl_count"],
             "query_policy": self.query_policy,
             "fusion_method": self.fusion_method,
-            "agent_utilization": {aid: calls / n for aid, calls in self.metrics["agent_calls"].items()},
+            "agent_utilization": util_rates,
         }

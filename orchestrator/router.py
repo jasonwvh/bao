@@ -21,9 +21,11 @@ def _min_expected_action_cost(p_mal: float, costs: DecisionCosts) -> float:
 class RouterScore:
     agent_id: str
     expected_gain: float
+    expected_gain_adjusted: float
     current_action_cost: float
     expected_action_cost_after: float
     query_cost: float
+    utilization_penalty: float
     reliability: float
     estimated_candidate_prob: float
     estimated_p_after: float
@@ -33,9 +35,11 @@ class RouterScore:
         return {
             "agent_id": self.agent_id,
             "expected_gain": self.expected_gain,
+            "expected_gain_adjusted": self.expected_gain_adjusted,
             "current_action_cost": self.current_action_cost,
             "expected_action_cost_after": self.expected_action_cost_after,
             "query_cost": self.query_cost,
+            "utilization_penalty": self.utilization_penalty,
             "reliability": self.reliability,
             "estimated_candidate_prob": self.estimated_candidate_prob,
             "estimated_p_after": self.estimated_p_after,
@@ -151,6 +155,7 @@ class AdaptiveRouter:
         candidate_agents: Iterable[str],
         agent_handles: Dict[str, AgentRuntimeHandle],
         belief_manager: Any,
+        utilization_penalties: Optional[Dict[str, float]] = None,
     ) -> Dict[str, RouterScore]:
         p_current = _clip_probability(current_probability)
         current_cost = _min_expected_action_cost(p_current, self.decision_costs)
@@ -172,12 +177,16 @@ class AdaptiveRouter:
             after_cost = _min_expected_action_cost(p_after, self.decision_costs)
             query_cost = float(handle.cost)
             gain = current_cost - after_cost - query_cost
+            util_penalty = float((utilization_penalties or {}).get(aid, 0.0))
+            gain_adjusted = gain - util_penalty
             scores[aid] = RouterScore(
                 agent_id=aid,
                 expected_gain=float(gain),
+                expected_gain_adjusted=float(gain_adjusted),
                 current_action_cost=float(current_cost),
                 expected_action_cost_after=float(after_cost),
                 query_cost=query_cost,
+                utilization_penalty=float(util_penalty),
                 reliability=float(reliability),
                 estimated_candidate_prob=float(est_prob),
                 estimated_p_after=float(p_after),
@@ -194,6 +203,7 @@ class AdaptiveRouter:
         agent_handles: Dict[str, AgentRuntimeHandle],
         belief_manager: Any,
         min_expected_gain: float,
+        utilization_penalties: Optional[Dict[str, float]] = None,
     ) -> Tuple[Optional[str], Dict[str, RouterScore]]:
         scores = self.score_candidates(
             current_probability=current_probability,
@@ -201,6 +211,7 @@ class AdaptiveRouter:
             candidate_agents=candidate_agents,
             agent_handles=agent_handles,
             belief_manager=belief_manager,
+            utilization_penalties=utilization_penalties,
         )
         if not scores:
             return None, {}
@@ -210,12 +221,12 @@ class AdaptiveRouter:
         best_score: Optional[RouterScore] = None
         for aid in candidate_agents:
             score = scores[aid]
-            if best_score is None or score.expected_gain > best_score.expected_gain:
+            if best_score is None or score.expected_gain_adjusted > best_score.expected_gain_adjusted:
                 best_agent = aid
                 best_score = score
 
         if best_agent is None or best_score is None:
             return None, scores
-        if float(best_score.expected_gain) <= float(min_expected_gain):
+        if float(best_score.expected_gain_adjusted) <= float(min_expected_gain):
             return None, scores
         return best_agent, scores

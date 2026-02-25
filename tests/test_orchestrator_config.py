@@ -51,16 +51,22 @@ class OrchestratorConfigTests(unittest.TestCase):
             path = tmp / "cfg.yaml"
             path.write_text(yaml.dump(cfg))
             loaded = load_orchestrator_config(path)
+            self.assertEqual(loaded.orchestration.engine, "deterministic")
+            self.assertEqual(loaded.orchestration.first_agent_strategy, "explicit")
             self.assertEqual(loaded.query.policy, "adaptive_router")
             self.assertAlmostEqual(float(loaded.query.uncertainty_threshold), 0.64, places=12)
             self.assertEqual(int(loaded.query.max_agents), 3)
             self.assertEqual(loaded.query.first_agent, "a1")
+            self.assertEqual(int(loaded.query.utilization_warmup_flows), 500)
+            self.assertEqual(len(loaded.query.utilization_targets), 0)
             self.assertAlmostEqual(float(loaded.query.min_expected_gain), 0.3, places=12)
             self.assertEqual(loaded.fusion.method, "logit_pool")
             self.assertAlmostEqual(float(loaded.decision.accuracy_floor_delta), 0.02, places=12)
             self.assertTrue(bool(loaded.decision.cost_calibration.enabled))
             self.assertEqual(loaded.decision.cost_calibration.mode, "validation_derived")
             self.assertEqual(int(loaded.routing.bin_count), 16)
+            self.assertAlmostEqual(float(loaded.routing.langgraph_perf_guardrail_overhead), 0.05, places=12)
+            self.assertAlmostEqual(float(loaded.routing.parity_tolerance), 1e-6, places=12)
 
 
 if __name__ == "__main__":

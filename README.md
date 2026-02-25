@@ -9,8 +9,10 @@ Containerized multi-agent orchestrator with a deterministic Bayesian cascade con
 - Shared state backend (SQLite) keyed by `agent_id`
 - Posterior-first belief updates with optional strict-likelihood mode
 - Expected-cost action selection (`accept` / `reject` / `defer`)
-- Adaptive utility router (`ocsvm` first, then expected-gain selection)
+- Adaptive utility router (dynamic cheapest-first + expected-gain selection)
 - Approximate VOI query gating for strict-cascade mode
+- Dual runtime support: deterministic default, optional LangGraph parity runtime
+- Split semantics: `decision` (classification) and `action_decision` (utility action)
 
 **Architecture diagram**
 
@@ -71,6 +73,7 @@ python3 main.py \
   --dataset data/UNSW_NB15_testing-set.csv \
   --config config/orchestrator_config.yaml \
   --prediction-source decision \
+  --engine deterministic \
   --reset-state
 ```
 
@@ -109,6 +112,17 @@ python3 benchmark/run_matrix.py \
   --dataset data/UNSW_NB15_testing-set.csv \
   --config config/orchestrator_config.yaml \
   --output-root artifacts/replay/matrix
+
+# Engine parity / performance
+python3 benchmark/validate_parity.py \
+  --dataset data/UNSW_NB15_testing-set.csv \
+  --config config/orchestrator_config.yaml \
+  --max-flows 1000
+
+python3 benchmark/compare_engines.py \
+  --dataset data/UNSW_NB15_testing-set.csv \
+  --config config/orchestrator_config.yaml \
+  --max-flows 2000
 ```
 
 ### 6) Stop agents
@@ -170,8 +184,15 @@ make down
   - `query.uncertainty_threshold`
   - `query.max_agents`
   - `query.min_expected_gain`
+  - `query.utilization_warmup_flows`
+  - `query.utilization_targets`
   - `routing.profile_path`
+  - `routing.langgraph_perf_guardrail_overhead`
+  - `routing.parity_tolerance`
   - `voi.enabled` and `voi.rho`
+- Runtime engine selection:
+  - `orchestration.engine` (`deterministic` or `langgraph`)
+  - `orchestration.first_agent_strategy` (`dynamic_cheapest` or `explicit`)
 
 ## Project layout
 
