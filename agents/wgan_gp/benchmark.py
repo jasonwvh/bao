@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv", help="CSV or parquet dataset")
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
-    p.add_argument("--config", default="config/orchestrator_config.yaml", help="Path to orchestrator config YAML")
+    p.add_argument("--config", default="config/orchestrator_config.utility.yaml", help="Path to orchestrator config YAML")
     p.add_argument("--registry", default=None, help="Optional path to A2A agent registry YAML override")
     p.add_argument("--cost", type=float, default=None, help="Override cost per inference")
     p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default="probability")

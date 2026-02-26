@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Calibrate decision costs with an accuracy floor")
     p.add_argument("--input-root", default="artifacts/replay/matrix", help="Root containing replay_results_<agent>.json")
     p.add_argument("--profile-path", required=True, help="Router profile JSON")
-    p.add_argument("--base-config", default="config/orchestrator_config.yaml", help="Base orchestrator config")
+    p.add_argument("--base-config", default="config/orchestrator_config.utility.yaml", help="Base orchestrator config")
     p.add_argument("--output-json", default="artifacts/replay/cost_calibration.json", help="Calibration summary output")
     p.add_argument("--output-config", default="artifacts/replay/orchestrator_calibrated.yaml", help="Calibrated config output")
     p.add_argument("--agents", default=None, help="Comma-separated agent sequence (defaults to config)")

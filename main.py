@@ -50,7 +50,7 @@ def setup_logging(level: int = logging.INFO) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run orchestrator replay pipeline")
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv", help="CSV or parquet with label column")
-    p.add_argument("--config", default="config/orchestrator_config.yaml", help="Path to orchestrator config YAML")
+    p.add_argument("--config", default="config/orchestrator_config.utility.yaml", help="Path to orchestrator config YAML")
     p.add_argument("--max-flows", type=int, default=0, help="Max flows to process (0=all)")
     p.add_argument("--output-dir", default="artifacts/replay", help="Output directory")
     p.add_argument("--seed", type=int, default=7, help="Seed")

@@ -26,30 +26,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(nam
 logger = logging.getLogger("lstm_autoencoder")
 
 
-class LegacyTabularAutoencoder(nn.Module):
-    def __init__(self, in_dim: int, latent_dim: int = 64, dropout: float = 0.1):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, latent_dim),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, in_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decoder(self.encoder(x))
-
-
 class SequenceLSTMAutoencoder(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int = 64, num_layers: int = 1, dropout: float = 0.1):
         super().__init__()
@@ -127,29 +103,17 @@ class LSTMAutoencoderAgent:
 
         self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
         cfg = payload.get("model_config", {})
-        meta = payload.get("meta", {})
-        model_type_meta = str(meta.get("model_type", "")).strip().lower()
-
         self.window_size = max(1, int(cfg.get("window_size", 1)))
         self.stream_buffers = StreamSequenceBuffer(window_size=self.window_size)
 
-        is_sequence = bool(self.window_size > 1 or model_type_meta.startswith("sequence_lstm"))
         in_dim = int(cfg.get("in_dim"))
-        if is_sequence:
-            self.model = SequenceLSTMAutoencoder(
-                in_dim=in_dim,
-                hidden_dim=int(cfg.get("hidden_dim", cfg.get("latent_dim", 64))),
-                num_layers=int(cfg.get("num_layers", 1)),
-                dropout=float(cfg.get("dropout", 0.1)),
-            )
-            self.model_type = "sequence_lstm_autoencoder"
-        else:
-            self.model = LegacyTabularAutoencoder(
-                in_dim=in_dim,
-                latent_dim=int(cfg.get("latent_dim", cfg.get("hidden_dim", 64))),
-                dropout=float(cfg.get("dropout", 0.1)),
-            )
-            self.model_type = "legacy_tabular_autoencoder"
+        self.model = SequenceLSTMAutoencoder(
+            in_dim=in_dim,
+            hidden_dim=int(cfg.get("hidden_dim", cfg.get("latent_dim", 64))),
+            num_layers=int(cfg.get("num_layers", 1)),
+            dropout=float(cfg.get("dropout", 0.1)),
+        )
+        self.model_type = "sequence_lstm_autoencoder"
         self.model.load_state_dict(payload["state_dict"])
         self.model.eval()
 
@@ -224,14 +188,8 @@ class LSTMAutoencoderAgent:
         return align_probability_threshold(p_raw, self.threshold_probability)
 
     def _score_flow(self, vector: np.ndarray, stream_id: str) -> float:
-        if self.model_type == "sequence_lstm_autoencoder":
-            seq = self.stream_buffers.append_and_get(stream_id, vector)
-            x = torch.from_numpy(seq.reshape(1, self.window_size, -1))
-            with torch.no_grad():
-                recon = self.model(x)
-                return float(torch.mean((recon - x) ** 2).item())
-
-        x = torch.from_numpy(vector.reshape(1, -1))
+        seq = self.stream_buffers.append_and_get(stream_id, vector)
+        x = torch.from_numpy(seq.reshape(1, self.window_size, -1))
         with torch.no_grad():
             recon = self.model(x)
             return float(torch.mean((recon - x) ** 2).item())

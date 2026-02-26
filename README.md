@@ -64,7 +64,7 @@ Requires a labeled dataset with a `label` column.
 ```bash
 python3 main.py \
   --dataset /path/to/replay.csv \
-  --config config/orchestrator_config.yaml \
+  --config config/orchestrator_config.utility.yaml \
   --max-flows 1000
 ```
 
@@ -72,7 +72,7 @@ Useful replay options:
 ```bash
 python3 main.py \
   --dataset data/UNSW_NB15_testing-set.csv \
-  --config config/orchestrator_config.yaml \
+  --config config/orchestrator_config.utility.yaml \
   --prediction-source decision \
   --engine deterministic \
   --reset-state
@@ -100,7 +100,7 @@ python3 agents/lstm_autoencoder/benchmark.py \
 # BAO replay
 python3 main.py \
   --dataset data/UNSW_NB15_testing-set.csv \
-  --config config/orchestrator_config.yaml \
+  --config config/orchestrator_config.utility.yaml \
   --max-agents 3 \
   --agent-sequence ocsvm,lstm_autoencoder,wgan_gp \
   --query-policy adaptive_router \
@@ -108,22 +108,11 @@ python3 main.py \
   --prediction-source decision \
   --output-dir artifacts/replay
 
-# Full matrix (all agents + router profile + cost calibration + BAO)
-python3 benchmark/run_matrix.py \
-  --dataset data/UNSW_NB15_testing-set.csv \
-  --config config/orchestrator_config.yaml \
-  --output-root artifacts/replay/matrix
-
-# Engine parity / performance
-python3 benchmark/validate_parity.py \
-  --dataset data/UNSW_NB15_testing-set.csv \
-  --config config/orchestrator_config.yaml \
-  --max-flows 1000
-
-python3 benchmark/compare_engines.py \
-  --dataset data/UNSW_NB15_testing-set.csv \
-  --config config/orchestrator_config.yaml \
-  --max-flows 2000
+# Build adaptive router profile from fresh single-agent replays
+python3 benchmark/build_router_profile.py \
+  --input-root artifacts/replay/matrix \
+  --output-path artifacts/replay/matrix/router_profile.json \
+  --config config/orchestrator_config.utility.yaml
 ```
 
 ### 6) Stop agents
@@ -177,7 +166,8 @@ make down
 ## Configuration
 
 - `config/agents.yaml`: registry for containerized agents
-- `config/orchestrator_config.yaml`: source of truth for update mode, fusion, decision costs, query policy, VOI, and benchmark behavior
+- `config/orchestrator_config.utility.yaml`: utility-first orchestration profile (default)
+- `config/orchestrator_config.accuracy.yaml`: accuracy-first orchestration profile
 - `config/agent_training.yaml`: source of truth for shared preprocessing and agent training/calibration hyperparameters
 - Query routing is fully dynamic for arbitrary agent counts:
   - `query.policy` (`adaptive_router` or `strict_cascade`)
@@ -214,7 +204,8 @@ make down
 ├── docker-compose.yml               # Agent containers
 ├── config/
 │   ├── agents.yaml                  # Agent registry
-│   └── orchestrator_config.yaml     # Orchestrator config
+│   ├── orchestrator_config.utility.yaml
+│   └── orchestrator_config.accuracy.yaml
 ├── orchestrator/
 │   ├── integrated_system.py         # Orchestrator runtime
 │   ├── control/                     # Policy, registry, scheduler

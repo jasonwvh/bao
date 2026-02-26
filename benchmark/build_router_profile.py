@@ -17,7 +17,7 @@ from orchestrator.config import file_sha256, load_orchestrator_config
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build adaptive-router profile from per-agent replay outputs")
-    p.add_argument("--config", default="config/orchestrator_config.yaml", help="Path to orchestrator config YAML")
+    p.add_argument("--config", default="config/orchestrator_config.utility.yaml", help="Path to orchestrator config YAML")
     p.add_argument("--input-root", default="artifacts/replay/matrix", help="Root containing replay_results_<agent>.json files")
     p.add_argument("--output-path", default="artifacts/replay/router_profile.json", help="Output profile JSON")
     p.add_argument("--agents", default=None, help="Comma-separated agent ids (defaults to orchestration.agent_sequence)")

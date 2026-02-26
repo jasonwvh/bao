@@ -32,7 +32,11 @@ def label_to_decision(label: object) -> Optional[str]:
 
 def load_default_decision_costs(config_path: Optional[str | Path] = None) -> DecisionCosts:
     repo_root = Path(__file__).resolve().parents[1]
-    cfg_path = Path(config_path).resolve() if config_path is not None else (repo_root / "config" / "orchestrator_config.yaml")
+    cfg_path = (
+        Path(config_path).resolve()
+        if config_path is not None
+        else (repo_root / "config" / "orchestrator_config.utility.yaml")
+    )
     cfg = load_orchestrator_config(cfg_path)
     return DecisionCosts(c_fn=float(cfg.decision.c_fn), c_fp=float(cfg.decision.c_fp), c_h=float(cfg.decision.c_h))
 
