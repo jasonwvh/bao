@@ -13,12 +13,17 @@ class BenchmarkMetricsTests(unittest.TestCase):
             probabilities=[0.1, 0.9, 0.8, 0.2],
             query_costs=[1.0, 1.0, 1.0, 1.0],
             action_costs=[0.0, 0.0, 5.0, 500.0],
+            action_decisions=["accept", "reject", "defer", "accept"],
+            utility_evaluation="cost_action_parity",
             approach="unit",
         )
         self.assertEqual(metrics["query_cost_total"], 4.0)
         self.assertEqual(metrics["action_cost_total"], 505.0)
         self.assertEqual(metrics["utility_cost_total"], 509.0)
         self.assertEqual(metrics["utility_cost_per_flow"], 127.25)
+        self.assertEqual(metrics["defer_count"], 1)
+        self.assertEqual(metrics["defer_rate"], 0.25)
+        self.assertEqual(metrics["utility_evaluation"], "cost_action_parity")
 
 
 if __name__ == "__main__":

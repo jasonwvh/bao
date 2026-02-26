@@ -10,6 +10,8 @@ def compute_metrics(
     costs: Optional[List[float]] = None,
     query_costs: Optional[List[float]] = None,
     action_costs: Optional[List[float]] = None,
+    action_decisions: Optional[List[str]] = None,
+    utility_evaluation: Optional[str] = None,
     approach: str = "unknown",
 ) -> Dict[str, float | int | str]:
     if len(predictions) != len(labels):
@@ -42,12 +44,17 @@ def compute_metrics(
         raise ValueError(f"query_costs ({len(q_costs)}) and labels ({total}) must have same length")
     if a_costs and len(a_costs) != total:
         raise ValueError(f"action_costs ({len(a_costs)}) and labels ({total}) must have same length")
+    decisions = [str(x).strip().lower() for x in (action_decisions or [])]
+    if decisions and len(decisions) != total:
+        raise ValueError(f"action_decisions ({len(decisions)}) and labels ({total}) must have same length")
 
     total_cost = sum(q_costs) if q_costs else 0.0
     avg_cost = total_cost / max(total, 1)
     action_cost_total = sum(a_costs) if a_costs else 0.0
     utility_cost_total = total_cost + action_cost_total
     utility_cost_per_flow = utility_cost_total / max(total, 1)
+    defer_count = sum(1 for d in decisions if d == "defer") if decisions else 0
+    defer_rate = defer_count / max(total, 1)
 
     return {
         "approach": approach,
@@ -63,6 +70,9 @@ def compute_metrics(
         "action_cost_total": round(action_cost_total, 4),
         "utility_cost_total": round(utility_cost_total, 4),
         "utility_cost_per_flow": round(utility_cost_per_flow, 4),
+        "defer_count": int(defer_count),
+        "defer_rate": round(float(defer_rate), 6),
+        "utility_evaluation": str(utility_evaluation or "cost_action_parity"),
         "true_positives": tp,
         "true_negatives": tn,
         "false_positives": fp,

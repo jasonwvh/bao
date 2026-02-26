@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -12,13 +13,20 @@ import numpy as np
 import torch
 from torch import nn
 
-from agents.common.calibration import align_probability_threshold, entropy_from_probability, logistic_probability
+from agents.common.calibration import (
+    align_probability_threshold,
+    class_uncertainty_from_probability,
+    entropy_from_probability,
+    logistic_probability,
+    normalize_uncertainty,
+)
+from agents.common.streaming import derive_stream_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("lstm_autoencoder")
 
 
-class TabularAutoencoder(nn.Module):
+class LegacyTabularAutoencoder(nn.Module):
     def __init__(self, in_dim: int, latent_dim: int = 64, dropout: float = 0.1):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -40,6 +48,59 @@ class TabularAutoencoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.encoder(x))
+
+
+class SequenceLSTMAutoencoder(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int = 64, num_layers: int = 1, dropout: float = 0.1):
+        super().__init__()
+        recurrent_dropout = float(dropout if int(num_layers) > 1 else 0.0)
+        self.encoder = nn.LSTM(
+            input_size=int(in_dim),
+            hidden_size=int(hidden_dim),
+            num_layers=int(num_layers),
+            batch_first=True,
+            dropout=recurrent_dropout,
+        )
+        self.decoder = nn.LSTM(
+            input_size=int(hidden_dim),
+            hidden_size=int(hidden_dim),
+            num_layers=int(num_layers),
+            batch_first=True,
+            dropout=recurrent_dropout,
+        )
+        self.out_proj = nn.Linear(int(hidden_dim), int(in_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = int(x.shape[1])
+        _, (h_n, _) = self.encoder(x)
+        latent = h_n[-1]
+        repeated = latent.unsqueeze(1).repeat(1, seq_len, 1)
+        dec, _ = self.decoder(repeated)
+        return self.out_proj(dec)
+
+
+class StreamSequenceBuffer:
+    def __init__(self, window_size: int, max_streams: int = 2048):
+        self.window_size = max(1, int(window_size))
+        self.max_streams = max(1, int(max_streams))
+        self._buffers: OrderedDict[str, deque[np.ndarray]] = OrderedDict()
+
+    def append_and_get(self, stream_id: str, vector: np.ndarray) -> np.ndarray:
+        sid = str(stream_id or "__global_stream__")
+        if sid not in self._buffers:
+            self._buffers[sid] = deque(maxlen=self.window_size)
+        self._buffers.move_to_end(sid)
+        self._buffers[sid].append(vector.astype(np.float32))
+        while len(self._buffers) > self.max_streams:
+            self._buffers.popitem(last=False)
+
+        seq = list(self._buffers[sid])
+        if len(seq) < self.window_size:
+            pad = [seq[0]] * (self.window_size - len(seq))
+            seq = pad + seq
+        else:
+            seq = seq[-self.window_size :]
+        return np.stack(seq, axis=0).astype(np.float32)
 
 
 class LSTMAutoencoderAgent:
@@ -66,12 +127,29 @@ class LSTMAutoencoderAgent:
 
         self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
         cfg = payload.get("model_config", {})
+        meta = payload.get("meta", {})
+        model_type_meta = str(meta.get("model_type", "")).strip().lower()
 
-        self.model = TabularAutoencoder(
-            in_dim=int(cfg.get("in_dim")),
-            latent_dim=int(cfg.get("latent_dim", 64)),
-            dropout=float(cfg.get("dropout", 0.1)),
-        )
+        self.window_size = max(1, int(cfg.get("window_size", 1)))
+        self.stream_buffers = StreamSequenceBuffer(window_size=self.window_size)
+
+        is_sequence = bool(self.window_size > 1 or model_type_meta.startswith("sequence_lstm"))
+        in_dim = int(cfg.get("in_dim"))
+        if is_sequence:
+            self.model = SequenceLSTMAutoencoder(
+                in_dim=in_dim,
+                hidden_dim=int(cfg.get("hidden_dim", cfg.get("latent_dim", 64))),
+                num_layers=int(cfg.get("num_layers", 1)),
+                dropout=float(cfg.get("dropout", 0.1)),
+            )
+            self.model_type = "sequence_lstm_autoencoder"
+        else:
+            self.model = LegacyTabularAutoencoder(
+                in_dim=in_dim,
+                latent_dim=int(cfg.get("latent_dim", cfg.get("hidden_dim", 64))),
+                dropout=float(cfg.get("dropout", 0.1)),
+            )
+            self.model_type = "legacy_tabular_autoencoder"
         self.model.load_state_dict(payload["state_dict"])
         self.model.eval()
 
@@ -145,6 +223,19 @@ class LSTMAutoencoderAgent:
         )
         return align_probability_threshold(p_raw, self.threshold_probability)
 
+    def _score_flow(self, vector: np.ndarray, stream_id: str) -> float:
+        if self.model_type == "sequence_lstm_autoencoder":
+            seq = self.stream_buffers.append_and_get(stream_id, vector)
+            x = torch.from_numpy(seq.reshape(1, self.window_size, -1))
+            with torch.no_grad():
+                recon = self.model(x)
+                return float(torch.mean((recon - x) ** 2).item())
+
+        x = torch.from_numpy(vector.reshape(1, -1))
+        with torch.no_grad():
+            recon = self.model(x)
+            return float(torch.mean((recon - x) ** 2).item())
+
     def predict_with_uncertainty(
         self,
         flow_features: Dict[str, Any],
@@ -152,16 +243,20 @@ class LSTMAutoencoderAgent:
         flow_id: Optional[str] = None,
         stream_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        del seed
+        sid = derive_stream_id(
+            flow_features=flow_features,
+            flow_id=flow_id,
+            explicit_stream_id=stream_id,
+        )
         n, c = self._transform_row(flow_features)
-        x = torch.from_numpy(self._vectorize(n, c).reshape(1, -1))
-
-        with torch.no_grad():
-            recon = self.model(x)
-            score = float(torch.mean((recon - x) ** 2).item())
+        vector = self._vectorize(n, c)
+        score = self._score_flow(vector, sid)
 
         p = self._score_to_prob(score)
         entropy = entropy_from_probability(p)
-        epistemic = float(max(0.0, 1.0 - min(abs(2.0 * p - 1.0), 1.0)))
+        epistemic = class_uncertainty_from_probability(p)
+        uncertainty = normalize_uncertainty(epistemic=epistemic, aleatoric=entropy)
 
         p_obs_given_attack = self._pdf(
             score,
@@ -178,11 +273,7 @@ class LSTMAutoencoderAgent:
         return {
             "proba": [1.0 - p, p],
             "prediction": {"label": label, "probability": p},
-            "uncertainty": {
-                "epistemic": epistemic,
-                "aleatoric": float(entropy),
-                "total_entropy": float(max(entropy, epistemic)),
-            },
+            "uncertainty": uncertainty,
             "likelihoods": {
                 "p_obs_given_attack": float(p_obs_given_attack),
                 "p_obs_given_clean": float(p_obs_given_clean),
@@ -190,12 +281,14 @@ class LSTMAutoencoderAgent:
             "cost": self.cost,
             "agent_id": self.agent_id,
             "metadata": {
-                "model": "lstm_autoencoder_tabular",
+                "model": "lstm_autoencoder",
+                "model_type": self.model_type,
                 "model_path": str(self.model_path),
                 "anomaly_score": score,
                 "threshold_probability": self.threshold_probability,
                 "threshold_aligned": 0.5,
-                "stream_id": stream_id if stream_id else "__global_stream__",
+                "stream_id": sid,
+                "window_size": int(self.window_size),
             },
         }
 

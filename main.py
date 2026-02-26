@@ -31,6 +31,7 @@ from orchestrator.config import (
     ORCHESTRATION_ENGINES,
     PREDICTION_SOURCES,
     QUERY_POLICIES,
+    UTILITY_EVALUATIONS,
     load_orchestrator_config,
 )
 from orchestrator.data.replay import load_replay_dataset
@@ -79,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--cost-calibration-json", default=None, help="Optional JSON with calibrated c_fn/c_fp/c_h")
     p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default=None)
+    p.add_argument("--utility-evaluation", choices=sorted(UTILITY_EVALUATIONS), default=None)
     p.add_argument("--diagnostic-dataset", default=None, help="Optional secondary replay dataset")
     p.add_argument("--reset-state", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=None)
@@ -127,6 +129,8 @@ def _apply_overrides(raw_config: Dict[str, Any], args: argparse.Namespace) -> Di
     benchmark = dict(cfg.get("benchmark", {}) or {})
     if args.prediction_source is not None:
         benchmark["prediction_source"] = str(args.prediction_source)
+    if args.utility_evaluation is not None:
+        benchmark["utility_evaluation"] = str(args.utility_evaluation)
     if args.reset_state is not None:
         benchmark["reset_state"] = bool(args.reset_state)
     if args.write_manifest is not None:
@@ -146,7 +150,7 @@ def _apply_overrides(raw_config: Dict[str, Any], args: argparse.Namespace) -> Di
 
     routing = dict(cfg.get("routing", {}) or {})
     if args.router_profile is not None:
-        routing["profile_path"] = str(args.router_profile)
+        routing["profile_path"] = str(Path(args.router_profile).expanduser().resolve())
     cfg["routing"] = routing
 
     return cfg
@@ -199,13 +203,18 @@ async def _run_dataset(
     rows: List[Dict[str, Any]],
     results_path: Path,
     prediction_source: str,
+    utility_evaluation: str,
     decision_costs: DecisionCosts,
     approach: str,
 ) -> Dict[str, Any]:
     if results_path.exists():
         results_path.unlink()
 
-    acc = BenchmarkAccumulator(prediction_source=prediction_source, decision_costs=decision_costs)
+    acc = BenchmarkAccumulator(
+        prediction_source=prediction_source,
+        utility_evaluation=utility_evaluation,
+        decision_costs=decision_costs,
+    )
 
     for row in rows:
         res = await system.process_flow(
@@ -221,6 +230,7 @@ async def _run_dataset(
             "action_decision": res.get("action_decision"),
             "compromise_prob": res.get("compromise_prob"),
             "epistemic_uncertainty": res.get("epistemic_uncertainty"),
+            "combined_uncertainty": res.get("combined_uncertainty"),
             "cumulative_cost": res.get("cumulative_cost"),
             "agents_queried": res.get("agents_queried"),
         }
@@ -255,6 +265,7 @@ def _build_calibrated_config(
     base_config_path: Path,
     output_dir: Path,
     prediction_source: str,
+    utility_evaluation: str,
     write_manifest: bool,
     max_flows: int,
 ) -> Path:
@@ -283,6 +294,8 @@ def _build_calibrated_config(
                 str(calibration_root / aid),
                 "--prediction-source",
                 prediction_source,
+                "--utility-evaluation",
+                utility_evaluation,
                 manifest_flag,
                 *max_flows_args,
             ]
@@ -344,6 +357,7 @@ async def _run(args: argparse.Namespace) -> None:
             base_config_path=runtime_config_path,
             output_dir=output_dir,
             prediction_source=cfg.benchmark.prediction_source,
+            utility_evaluation=cfg.benchmark.utility_evaluation,
             write_manifest=cfg.benchmark.write_manifest,
             max_flows=int(args.max_flows or 0),
         )
@@ -364,6 +378,7 @@ async def _run(args: argparse.Namespace) -> None:
         rows=rows,
         results_path=results_path,
         prediction_source=cfg.benchmark.prediction_source,
+        utility_evaluation=cfg.benchmark.utility_evaluation,
         decision_costs=DecisionCosts(c_fn=cfg.decision.c_fn, c_fp=cfg.decision.c_fp, c_h=cfg.decision.c_h),
         approach="bao",
     )
@@ -385,6 +400,7 @@ async def _run(args: argparse.Namespace) -> None:
             agents_used=list(system.agent_sequence),
             extra={
                 "prediction_source": cfg.benchmark.prediction_source,
+                "utility_evaluation": cfg.benchmark.utility_evaluation,
                 "dataset_composition": dataset_composition(rows),
                 "summary": summary,
             },
@@ -408,6 +424,7 @@ async def _run(args: argparse.Namespace) -> None:
                 rows=diagnostic_rows,
                 results_path=diagnostic_results,
                 prediction_source=cfg.benchmark.prediction_source,
+                utility_evaluation=cfg.benchmark.utility_evaluation,
                 decision_costs=DecisionCosts(c_fn=cfg.decision.c_fn, c_fp=cfg.decision.c_fp, c_h=cfg.decision.c_h),
                 approach="bao_diagnostic",
             )
@@ -421,6 +438,7 @@ async def _run(args: argparse.Namespace) -> None:
                     agents_used=list(diagnostic_system.agent_sequence),
                     extra={
                         "prediction_source": cfg.benchmark.prediction_source,
+                        "utility_evaluation": cfg.benchmark.utility_evaluation,
                         "dataset_composition": dataset_composition(diagnostic_rows),
                         "summary": diagnostic_system.get_system_statistics(),
                     },

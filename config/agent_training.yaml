@@ -17,6 +17,7 @@ ocsvm:
 
 lstm_autoencoder:
   hidden_dim: 64
+  num_layers: 1
   epochs: 20
   batch_size: 256
   learning_rate: 0.001
@@ -28,6 +29,7 @@ wgan_gp:
   epochs: 15
   batch_size: 256
   learning_rate: 0.0002
+  hidden_dim: 128
   z_dim: 32
   n_critic: 5
   lambda_gp: 10.0

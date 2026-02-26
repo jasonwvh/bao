@@ -338,5 +338,5 @@
     "clip_min": -15.0,
     "clip_max": 15.0
   },
-  "model": "tabular_autoencoder"
+  "model": "wgan_gp"
 }

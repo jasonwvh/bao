@@ -11,7 +11,13 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from agents.common.calibration import align_probability_threshold, entropy_from_probability, logistic_probability
+from agents.common.calibration import (
+    align_probability_threshold,
+    class_uncertainty_from_probability,
+    entropy_from_probability,
+    logistic_probability,
+    normalize_uncertainty,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("ocsvm")
@@ -50,6 +56,12 @@ class OCSVMAgent:
 
         self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
         self.score_stats = payload.get("score_stats", {})
+        density_model = payload.get("density_model", {})
+        self.density_bin_edges = np.asarray(density_model.get("bin_edges", []), dtype=np.float64)
+        self.density_values = np.asarray(density_model.get("density", []), dtype=np.float64)
+        if self.density_bin_edges.size < 2 or self.density_values.size == 0:
+            self.density_bin_edges = np.asarray([0.0, 1.0], dtype=np.float64)
+            self.density_values = np.asarray([1.0], dtype=np.float64)
 
     def _to_float(self, value: Any, default: float = 0.0) -> float:
         try:
@@ -104,6 +116,15 @@ class OCSVMAgent:
         coeff = 1.0 / (s * math.sqrt(2.0 * math.pi))
         return float(max(1e-9, coeff * math.exp(-((x - mu) ** 2) / (2.0 * s * s))))
 
+    def _local_density(self, score: float) -> float:
+        edges = self.density_bin_edges
+        vals = self.density_values
+        if edges.size < 2 or vals.size == 0:
+            return 1.0
+        idx = int(np.searchsorted(edges, float(score), side="right") - 1)
+        idx = int(np.clip(idx, 0, len(vals) - 1))
+        return float(np.clip(vals[idx], 0.0, 1.0))
+
     def predict_with_uncertainty(self, flow_features: Dict[str, Any], seed: Optional[int] = None) -> Dict[str, Any]:
         x = self._vectorize(flow_features).reshape(1, -1)
         anomaly_score = float(-self.model.decision_function(x)[0])
@@ -119,7 +140,11 @@ class OCSVMAgent:
         p = align_probability_threshold(p_raw, self.threshold_probability)
 
         entropy = entropy_from_probability(p)
-        epistemic = float(max(0.0, 1.0 - min(abs(2.0 * p - 1.0), 1.0)))
+        class_uncertainty = class_uncertainty_from_probability(p)
+        local_density = self._local_density(anomaly_score)
+        ood_uncertainty = float(max(0.0, 1.0 - local_density))
+        epistemic = float(max(class_uncertainty, ood_uncertainty))
+        uncertainty = normalize_uncertainty(epistemic=epistemic, aleatoric=entropy)
 
         p_obs_given_attack = self._pdf(
             anomaly_score,
@@ -136,11 +161,7 @@ class OCSVMAgent:
         return {
             "proba": [1.0 - p, p],
             "prediction": {"label": label, "probability": p},
-            "uncertainty": {
-                "epistemic": epistemic,
-                "aleatoric": float(entropy),
-                "total_entropy": float(max(epistemic, entropy)),
-            },
+            "uncertainty": uncertainty,
             "likelihoods": {
                 "p_obs_given_attack": float(p_obs_given_attack),
                 "p_obs_given_clean": float(p_obs_given_clean),
@@ -149,10 +170,13 @@ class OCSVMAgent:
             "agent_id": self.agent_id,
             "metadata": {
                 "model": "ocsvm",
+                "model_type": "one_class_svm",
                 "model_path": str(self.model_path),
                 "anomaly_score": anomaly_score,
                 "threshold_probability": self.threshold_probability,
                 "threshold_aligned": 0.5,
+                "ood_local_density": local_density,
+                "ood_uncertainty": ood_uncertainty,
             },
         }
 

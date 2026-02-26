@@ -20,11 +20,12 @@ from benchmark.runner import (
     label_to_decision,
     write_json,
 )
-from orchestrator.config import PREDICTION_SOURCES, load_orchestrator_config
+from agents.common.streaming import derive_stream_id
+from orchestrator.config import PREDICTION_SOURCES, UTILITY_EVALUATIONS, load_orchestrator_config
 from orchestrator.control.registry import load_registry, to_runtime_handles
 from orchestrator.data.replay import load_replay_dataset
 from orchestrator.data_plane.a2a_client import A2AClient
-from orchestrator.decision import DecisionCosts
+from orchestrator.decision import DecisionCosts, select_expected_cost_action
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,11 +37,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--registry", default=None, help="Optional path to A2A agent registry YAML override")
     p.add_argument("--cost", type=float, default=None, help="Override cost per inference")
     p.add_argument("--prediction-source", choices=sorted(PREDICTION_SOURCES), default="probability")
+    p.add_argument("--utility-evaluation", choices=sorted(UTILITY_EVALUATIONS), default=None)
     p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
 
 
 def _build_payload(row: dict) -> dict:
+    stream_id = derive_stream_id(
+        flow_features=dict(row.get("flow_features") or {}),
+        flow_id=str(row.get("flow_id") or ""),
+    )
     return {
         "request_id": str(uuid.uuid4()),
         "flow_id": row["flow_id"],
@@ -51,6 +57,7 @@ def _build_payload(row: dict) -> dict:
             "requested_capabilities": [],
             "elicit_likelihood": True,
             "seed": 7,
+            "stream_id": stream_id,
         },
     }
 
@@ -80,8 +87,14 @@ def main() -> None:
     if not rows:
         raise RuntimeError("No rows loaded from dataset")
 
+    utility_evaluation = (
+        str(args.utility_evaluation).strip().lower()
+        if args.utility_evaluation is not None
+        else str(cfg.benchmark.utility_evaluation).strip().lower()
+    )
     acc = BenchmarkAccumulator(
         prediction_source=args.prediction_source,
+        utility_evaluation=utility_evaluation,
         decision_costs=DecisionCosts(c_fn=cfg.decision.c_fn, c_fp=cfg.decision.c_fp, c_h=cfg.decision.c_h),
     )
     replay_rows = []
@@ -96,12 +109,16 @@ def main() -> None:
 
         label_hint = (output.get("prediction") or {}).get("label")
         decision = label_to_decision(label_hint)
+        if utility_evaluation == "cost_action_parity":
+            action_decision, _ = select_expected_cost_action(p_mal, acc.decision_costs)
+        else:
+            action_decision = decision
         acc.add_sample(
             true_label=int(true_label),
             probability=p_mal,
             cost=per_call_cost,
             decision=decision,
-            action_decision=decision,
+            action_decision=action_decision,
             label_hint=label_hint,
         )
         pred = infer_prediction(
@@ -121,6 +138,7 @@ def main() -> None:
         )
 
     metrics = acc.compute(approach="wgan_gp")
+    metrics["utility_evaluation"] = utility_evaluation
     replay_path = output_dir / "replay_results.json"
     replay_agent_path = output_dir / "replay_results_wgan_gp.json"
     replay_payload = json.dumps(replay_rows, indent=2)
@@ -139,6 +157,7 @@ def main() -> None:
             agents_used=["wgan_gp"],
             extra={
                 "prediction_source": args.prediction_source,
+                "utility_evaluation": utility_evaluation,
                 "dataset_composition": dataset_composition(rows),
                 "registry_path": str(Path(registry_path).resolve()),
             },

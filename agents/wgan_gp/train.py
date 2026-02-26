@@ -15,28 +15,34 @@ from agents.common.preprocessing import fit_preprocessor, load_csv, schema_to_js
 from agents.common.training_config import load_agent_training_config
 
 
-class TabularAutoencoder(nn.Module):
-    def __init__(self, in_dim: int, latent_dim: int = 64, dropout: float = 0.1):
+class Generator(nn.Module):
+    def __init__(self, z_dim: int, out_dim: int, hidden_dim: int = 128):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(in_dim, 256),
+        self.net = nn.Sequential(
+            nn.Linear(int(z_dim), int(hidden_dim)),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
+            nn.Linear(int(hidden_dim), int(hidden_dim) * 2),
             nn.ReLU(),
-            nn.Linear(128, latent_dim),
+            nn.Linear(int(hidden_dim) * 2, int(out_dim)),
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, in_dim),
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class Critic(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim), int(hidden_dim) * 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(hidden_dim) * 2, int(hidden_dim)),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(hidden_dim), 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decoder(self.encoder(x))
+        return self.net(x)
 
 
 def _vectorize(num: np.ndarray, cat: np.ndarray, cat_cardinalities: list[int]) -> np.ndarray:
@@ -58,6 +64,31 @@ def _vectorize(num: np.ndarray, cat: np.ndarray, cat_cardinalities: list[int]) -
     return np.concatenate([num, cat_oh], axis=1)
 
 
+def _gradient_penalty(critic: Critic, real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+    alpha = torch.rand((real.size(0), 1), device=real.device, dtype=real.dtype)
+    interp = (alpha * real + (1.0 - alpha) * fake).requires_grad_(True)
+    crit_interp = critic(interp)
+    grad_outputs = torch.ones_like(crit_interp)
+    grads = torch.autograd.grad(
+        outputs=crit_interp,
+        inputs=interp,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    grads = grads.view(grads.size(0), -1)
+    return ((grads.norm(2, dim=1) - 1.0) ** 2).mean()
+
+
+def _score_samples(critic: Critic, x_np: np.ndarray) -> np.ndarray:
+    critic.eval()
+    with torch.no_grad():
+        x = torch.from_numpy(x_np.astype(np.float32))
+        # Higher anomaly score should indicate more suspicious.
+        return (-critic(x).squeeze(1)).cpu().numpy()
+
+
 def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> None:
     cfg = load_agent_training_config(config_path)
     shared = dict(cfg.get("shared", {}))
@@ -72,11 +103,13 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
     p_lo = float(probability_clip[0])
     p_hi = float(probability_clip[1])
 
-    latent_dim = int(agent_cfg.get("z_dim", 64))
+    z_dim = int(agent_cfg.get("z_dim", 32))
+    hidden_dim = int(agent_cfg.get("hidden_dim", 128))
     epochs = int(agent_cfg.get("epochs", 20))
     batch_size = int(agent_cfg.get("batch_size", 256))
-    learning_rate = float(agent_cfg.get("learning_rate", 1e-3))
-    dropout = float(agent_cfg.get("dropout", 0.1))
+    learning_rate = float(agent_cfg.get("learning_rate", 2e-4))
+    n_critic = max(1, int(agent_cfg.get("n_critic", 5)))
+    lambda_gp = float(agent_cfg.get("lambda_gp", 10.0))
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -117,34 +150,42 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
 
     x_train_normal = x_train[y_train == 0]
     if len(x_train_normal) == 0:
-        raise RuntimeError("No benign rows found for autoencoder training")
+        raise RuntimeError("No benign rows found for WGAN-GP training")
 
-    model = TabularAutoencoder(in_dim=x_train.shape[1], latent_dim=latent_dim, dropout=dropout)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
+    generator = Generator(z_dim=z_dim, out_dim=int(x_train.shape[1]), hidden_dim=hidden_dim)
+    critic = Critic(in_dim=int(x_train.shape[1]), hidden_dim=hidden_dim)
+    opt_g = torch.optim.Adam(generator.parameters(), lr=learning_rate, betas=(0.5, 0.9))
+    opt_c = torch.optim.Adam(critic.parameters(), lr=learning_rate, betas=(0.5, 0.9))
 
-    loader = DataLoader(TensorDataset(torch.from_numpy(x_train_normal)), batch_size=batch_size, shuffle=True)
+    loader = DataLoader(TensorDataset(torch.from_numpy(x_train_normal.astype(np.float32))), batch_size=batch_size, shuffle=True)
 
-    model.train()
+    generator.train()
+    critic.train()
     for _ in range(epochs):
-        for (batch_x,) in loader:
-            optimizer.zero_grad(set_to_none=True)
-            recon = model(batch_x)
-            loss = criterion(recon, batch_x)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+        for (real_batch,) in loader:
+            real = real_batch
 
-    model.eval()
-    with torch.no_grad():
-        x_train_t = torch.from_numpy(x_train)
-        x_cal_t = torch.from_numpy(x_cal)
+            for _ in range(n_critic):
+                z = torch.randn(real.size(0), z_dim, dtype=real.dtype)
+                fake = generator(z).detach()
+                c_real = critic(real).mean()
+                c_fake = critic(fake).mean()
+                gp = _gradient_penalty(critic, real, fake)
+                loss_c = -(c_real - c_fake) + lambda_gp * gp
 
-        recon_train = model(x_train_t)
-        recon_cal = model(x_cal_t)
+                opt_c.zero_grad(set_to_none=True)
+                loss_c.backward()
+                opt_c.step()
 
-        scores_train = torch.mean((recon_train - x_train_t) ** 2, dim=1).cpu().numpy()
-        scores_cal = torch.mean((recon_cal - x_cal_t) ** 2, dim=1).cpu().numpy()
+            z = torch.randn(real.size(0), z_dim, dtype=real.dtype)
+            fake = generator(z)
+            loss_g = -critic(fake).mean()
+            opt_g.zero_grad(set_to_none=True)
+            loss_g.backward()
+            opt_g.step()
+
+    scores_train = _score_samples(critic, x_train)
+    scores_cal = _score_samples(critic, x_cal)
 
     calibrator = fit_logistic_calibrator(scores_cal, y_cal, seed=seed)
     probs_cal = logistic_probability(scores_cal, calibrator, clip_lo=p_lo, clip_hi=p_hi)
@@ -152,15 +193,19 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
 
     benign = scores_cal[y_cal == 0] if np.any(y_cal == 0) else scores_cal
     malicious = scores_cal[y_cal == 1] if np.any(y_cal == 1) else scores_cal
+    train_benign = scores_train[y_train == 0] if np.any(y_train == 0) else scores_train
 
     payload = {
-        "state_dict": model.state_dict(),
+        "generator_state_dict": generator.state_dict(),
+        "critic_state_dict": critic.state_dict(),
         "preprocessor": pre.to_dict(),
         "cat_cardinalities": cat_cardinalities,
         "model_config": {
             "in_dim": int(x_train.shape[1]),
-            "latent_dim": int(latent_dim),
-            "dropout": float(dropout),
+            "z_dim": int(z_dim),
+            "hidden_dim": int(hidden_dim),
+            "n_critic": int(n_critic),
+            "lambda_gp": float(lambda_gp),
         },
         "calibration": calibrator,
         "threshold_probability": float(threshold_prob),
@@ -173,10 +218,11 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "benign_std": float(benign.std() + 1e-9),
             "mal_mean": float(malicious.mean()),
             "mal_std": float(malicious.std() + 1e-9),
-            "train_benign_mean": float(scores_train[y_train == 0].mean()),
-            "train_benign_std": float(scores_train[y_train == 0].std() + 1e-9),
+            "train_benign_mean": float(train_benign.mean()),
+            "train_benign_std": float(train_benign.std() + 1e-9),
         },
         "meta": {
+            "model_type": "wgan_gp",
             "dataset": str(dataset),
             "rows": int(len(df)),
             "train_rows": int(len(train_df)),
@@ -194,7 +240,7 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output)
 
-    schema_to_json(pre, output.with_suffix(".schema.json"), extra={"model": "tabular_autoencoder"})
+    schema_to_json(pre, output.with_suffix(".schema.json"), extra={"model": "wgan_gp"})
 
     print(
         json.dumps(
@@ -214,7 +260,7 @@ def parse_args() -> argparse.Namespace:
     default_model = Path(__file__).resolve().parent / "models" / "wgan_gp.pt"
     default_cfg = Path(__file__).resolve().parents[2] / "config" / "agent_training.yaml"
 
-    p = argparse.ArgumentParser(description="Train tabular autoencoder for UNSW-NB15")
+    p = argparse.ArgumentParser(description="Train WGAN-GP tabular anomaly model for UNSW-NB15")
     p.add_argument("--dataset", default=str(default_data), help="Path to UNSW training CSV")
     p.add_argument("--output", default=str(default_model), help="Output .pt model path")
     p.add_argument("--seed", type=int, default=42)

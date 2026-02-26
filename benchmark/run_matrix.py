@@ -15,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 from benchmark.metrics import compute_metrics
 from orchestrator.config import load_orchestrator_config
 from orchestrator.control.registry import load_registry, to_runtime_handles
-from orchestrator.decision import DecisionCosts, realized_action_cost
+from orchestrator.decision import DecisionCosts, realized_action_cost, select_expected_cost_action
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-root", default="artifacts/replay/matrix", help="Output root directory")
     p.add_argument("--max-flows", type=int, default=0, help="Limit number of flows (0=all)")
     p.add_argument("--prediction-source", choices=["decision", "probability"], default="decision")
+    p.add_argument("--utility-evaluation", choices=["cost_action_parity", "legacy_mixed"], default=None)
     p.add_argument("--write-manifest", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--build-profile", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--calibrate-costs", action=argparse.BooleanOptionalAction, default=True)
@@ -52,14 +53,15 @@ def _agent_metrics_with_costs(replay_path: Path, *, per_call_cost: float, costs:
     labels = [int(r["true_label"]) for r in rows]
     probabilities = [float(r["probability"]) for r in rows]
     query_costs = [float(per_call_cost)] * len(rows)
+    action_decisions = [select_expected_cost_action(float(r["probability"]), costs)[0] for r in rows]
     action_costs = [
         realized_action_cost(
-            decision=None,
+            decision=action_decisions[i],
             prediction=int(r["prediction"]),
             true_label=int(r["true_label"]),
             costs=costs,
         )
-        for r in rows
+        for i, r in enumerate(rows)
     ]
     return compute_metrics(
         predictions=predictions,
@@ -67,6 +69,8 @@ def _agent_metrics_with_costs(replay_path: Path, *, per_call_cost: float, costs:
         probabilities=probabilities,
         query_costs=query_costs,
         action_costs=action_costs,
+        action_decisions=action_decisions,
+        utility_evaluation="cost_action_parity",
         approach=approach,
     )
 
@@ -88,6 +92,8 @@ def main() -> None:
     max_flows_args: List[str] = []
     if args.max_flows and int(args.max_flows) > 0:
         max_flows_args = ["--max-flows", str(int(args.max_flows))]
+    utility_eval = str(args.utility_evaluation or orch_cfg.benchmark.utility_evaluation)
+    utility_eval_args = ["--utility-evaluation", utility_eval]
 
     manifest_flag = "--write-manifest" if bool(args.write_manifest) else "--no-write-manifest"
 
@@ -103,6 +109,7 @@ def main() -> None:
             str(out_root / "ocsvm"),
             "--prediction-source",
             args.prediction_source,
+            *utility_eval_args,
             manifest_flag,
             *max_flows_args,
         ]
@@ -119,6 +126,7 @@ def main() -> None:
             str(out_root / "lstm_autoencoder"),
             "--prediction-source",
             args.prediction_source,
+            *utility_eval_args,
             manifest_flag,
             *max_flows_args,
         ]
@@ -135,6 +143,7 @@ def main() -> None:
             str(out_root / "wgan_gp"),
             "--prediction-source",
             args.prediction_source,
+            *utility_eval_args,
             manifest_flag,
             *max_flows_args,
         ]
@@ -189,6 +198,7 @@ def main() -> None:
             str(out_root / "bao"),
             "--prediction-source",
             args.prediction_source,
+            *utility_eval_args,
             manifest_flag,
             *max_flows_args,
         ]

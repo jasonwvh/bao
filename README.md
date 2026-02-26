@@ -10,6 +10,7 @@ Containerized multi-agent orchestrator with a deterministic Bayesian cascade con
 - Posterior-first belief updates with optional strict-likelihood mode
 - Expected-cost action selection (`accept` / `reject` / `defer`)
 - Adaptive utility router (dynamic cheapest-first + expected-gain + utilization-band exploration)
+- Cost-action parity utility accounting for BAO and single-agent baselines
 - Approximate VOI query gating for strict-cascade mode
 - Dual runtime support: deterministic default, optional LangGraph parity runtime
 - Split semantics: `decision` (classification) and `action_decision` (utility action)
@@ -135,8 +136,8 @@ make down
 | Agent | Port | Model | Description |
 |-------|------|-------|-------------|
 | `ocsvm` | 8081 | sklearn One-Class SVM | Lightweight one-class anomaly detector |
-| `lstm_autoencoder` | 8082 | PyTorch Hybrid LSTM Autoencoder | Temporal reconstruction anomaly detector |
-| `wgan_gp` | 8084 | PyTorch WGAN-GP | Generative anomaly detector |
+| `lstm_autoencoder` | 8082 | PyTorch Sequence LSTM Autoencoder | Temporal reconstruction anomaly detector |
+| `wgan_gp` | 8084 | PyTorch WGAN-GP (critic/generator) | Generative anomaly detector |
 
 ## A2A HTTP Contract
 
@@ -197,7 +198,8 @@ make down
   - `routing.profile_path`
   - `routing.langgraph_perf_guardrail_overhead`
   - `routing.parity_tolerance`
-  - `voi.enabled` and `voi.rho`
+  - Default showcase sequence is two-stage (`ocsvm -> lstm_autoencoder`), with `wgan_gp` optional via explicit sequence override
+- `voi.enabled` and `voi.rho`
 - Runtime engine selection:
   - `orchestration.engine` (`deterministic` or `langgraph`)
   - `orchestration.first_agent_strategy` (`dynamic_cheapest` or `explicit`)

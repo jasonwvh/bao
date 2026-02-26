@@ -40,11 +40,13 @@ def load_default_decision_costs(config_path: Optional[str | Path] = None) -> Dec
 @dataclass
 class BenchmarkAccumulator:
     prediction_source: str = "probability"
+    utility_evaluation: str = "cost_action_parity"
     predictions: List[int] = field(default_factory=list)
     labels: List[int] = field(default_factory=list)
     probabilities: List[float] = field(default_factory=list)
     query_costs: List[float] = field(default_factory=list)
     action_costs: List[float] = field(default_factory=list)
+    action_decisions: List[str] = field(default_factory=list)
     decision_costs: DecisionCosts = field(default_factory=load_default_decision_costs)
 
     def add_sample(
@@ -65,8 +67,15 @@ class BenchmarkAccumulator:
             label_hint=label_hint,
             decision_costs=self.decision_costs,
         )
+        resolved_action_decision: Optional[str]
+        if action_decision is not None:
+            resolved_action_decision = str(action_decision).strip().lower()
+        elif decision is not None:
+            resolved_action_decision = str(decision).strip().lower()
+        else:
+            resolved_action_decision, _ = select_expected_cost_action(p, self.decision_costs)
         action_cost = realized_action_cost(
-            decision=action_decision if action_decision is not None else decision,
+            decision=resolved_action_decision,
             prediction=pred,
             true_label=int(true_label),
             costs=self.decision_costs,
@@ -77,6 +86,7 @@ class BenchmarkAccumulator:
         self.predictions.append(int(pred))
         self.query_costs.append(float(cost))
         self.action_costs.append(float(action_cost))
+        self.action_decisions.append(str(resolved_action_decision or "").strip().lower())
 
     def compute(self, approach: str) -> Dict[str, Any]:
         return compute_metrics(
@@ -86,6 +96,8 @@ class BenchmarkAccumulator:
             costs=self.query_costs,
             query_costs=self.query_costs,
             action_costs=self.action_costs,
+            action_decisions=self.action_decisions,
+            utility_evaluation=self.utility_evaluation,
             approach=approach,
         )
 

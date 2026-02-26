@@ -5,6 +5,8 @@ from typing import Dict, Iterable, Tuple
 
 import numpy as np
 
+LN2 = math.log(2.0)
+
 
 def _clip_probability(p: np.ndarray | float, lo: float, hi: float) -> np.ndarray | float:
     return np.clip(p, lo, hi)
@@ -92,6 +94,24 @@ def select_probability_threshold(
 def entropy_from_probability(p: float) -> float:
     p_clip = float(np.clip(p, 1e-9, 1.0 - 1e-9))
     return -(p_clip * math.log(p_clip) + (1.0 - p_clip) * math.log(1.0 - p_clip))
+
+
+def class_uncertainty_from_probability(p: float) -> float:
+    """Symmetric confidence gap mapped to [0, 1], highest at p=0.5."""
+    p_clip = float(np.clip(p, 1e-9, 1.0 - 1e-9))
+    return float(max(0.0, min(1.0, 1.0 - min(abs(2.0 * p_clip - 1.0), 1.0))))
+
+
+def normalize_uncertainty(epistemic: float, aleatoric: float) -> Dict[str, float]:
+    """Normalize uncertainty channels and enforce consistent total entropy semantics."""
+    ep = float(np.clip(epistemic, 0.0, 1.0))
+    al = float(np.clip(aleatoric, 0.0, LN2))
+    total = float(max(al, ep * LN2))
+    return {
+        "epistemic": ep,
+        "aleatoric": al,
+        "total_entropy": total,
+    }
 
 
 def align_probability_threshold(probability: float, threshold_probability: float) -> float:

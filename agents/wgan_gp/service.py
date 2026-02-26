@@ -12,13 +12,19 @@ import numpy as np
 import torch
 from torch import nn
 
-from agents.common.calibration import align_probability_threshold, entropy_from_probability, logistic_probability
+from agents.common.calibration import (
+    align_probability_threshold,
+    class_uncertainty_from_probability,
+    entropy_from_probability,
+    logistic_probability,
+    normalize_uncertainty,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("wgan_gp")
 
 
-class TabularAutoencoder(nn.Module):
+class LegacyTabularAutoencoder(nn.Module):
     def __init__(self, in_dim: int, latent_dim: int = 64, dropout: float = 0.1):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -40,6 +46,36 @@ class TabularAutoencoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.encoder(x))
+
+
+class Generator(nn.Module):
+    def __init__(self, z_dim: int, out_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(int(z_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Linear(int(hidden_dim), int(hidden_dim) * 2),
+            nn.ReLU(),
+            nn.Linear(int(hidden_dim) * 2, int(out_dim)),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class Critic(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim), int(hidden_dim) * 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(hidden_dim) * 2, int(hidden_dim)),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(hidden_dim), 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class WGANGPAgent:
@@ -71,14 +107,31 @@ class WGANGPAgent:
         self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
 
         cfg = payload.get("model_config", {})
-
-        self.model = TabularAutoencoder(
-            in_dim=int(cfg.get("in_dim")),
-            latent_dim=int(cfg.get("latent_dim", 64)),
-            dropout=float(cfg.get("dropout", 0.1)),
-        )
-        self.model.load_state_dict(payload["state_dict"])
-        self.model.eval()
+        in_dim = int(cfg.get("in_dim"))
+        if "critic_state_dict" in payload:
+            self.generator = Generator(
+                z_dim=int(cfg.get("z_dim", 32)),
+                out_dim=in_dim,
+                hidden_dim=int(cfg.get("hidden_dim", 128)),
+            )
+            self.critic = Critic(in_dim=in_dim, hidden_dim=int(cfg.get("hidden_dim", 128)))
+            self.generator.load_state_dict(payload["generator_state_dict"])
+            self.critic.load_state_dict(payload["critic_state_dict"])
+            self.generator.eval()
+            self.critic.eval()
+            self.legacy_model = None
+            self.model_type = "wgan_gp"
+        else:
+            self.legacy_model = LegacyTabularAutoencoder(
+                in_dim=in_dim,
+                latent_dim=int(cfg.get("latent_dim", 64)),
+                dropout=float(cfg.get("dropout", 0.1)),
+            )
+            self.legacy_model.load_state_dict(payload["state_dict"])
+            self.legacy_model.eval()
+            self.generator = None
+            self.critic = None
+            self.model_type = "legacy_tabular_autoencoder"
 
         self.calibration = payload.get("calibration", {})
         self.threshold_probability = float(payload.get("threshold_probability", 0.5))
@@ -150,16 +203,25 @@ class WGANGPAgent:
         )
         return align_probability_threshold(p_raw, self.threshold_probability)
 
-    def predict_with_uncertainty(self, flow_features: Dict[str, Any], seed: Optional[int] = None) -> Dict[str, Any]:
-        n, c = self._transform_row(flow_features)
-        x = torch.from_numpy(self._vectorize(n, c).reshape(1, -1))
+    def _score(self, vector: np.ndarray) -> float:
+        x = torch.from_numpy(vector.reshape(1, -1))
+        if self.critic is not None:
+            with torch.no_grad():
+                return float((-self.critic(x).squeeze(1)).item())
         with torch.no_grad():
-            recon = self.model(x)
-            score = float(torch.mean((recon - x) ** 2).item())
+            recon = self.legacy_model(x)
+            return float(torch.mean((recon - x) ** 2).item())
+
+    def predict_with_uncertainty(self, flow_features: Dict[str, Any], seed: Optional[int] = None) -> Dict[str, Any]:
+        del seed
+        n, c = self._transform_row(flow_features)
+        vector = self._vectorize(n, c)
+        score = self._score(vector)
 
         p = self._score_to_prob(score)
         entropy = entropy_from_probability(p)
-        epistemic = float(max(0.0, 1.0 - min(abs(2.0 * p - 1.0), 1.0)))
+        epistemic = class_uncertainty_from_probability(p)
+        uncertainty = normalize_uncertainty(epistemic=epistemic, aleatoric=entropy)
 
         p_obs_given_attack = self._pdf(
             score,
@@ -178,11 +240,7 @@ class WGANGPAgent:
                 "label": "malicious" if p >= 0.5 else "benign",
                 "probability": p,
             },
-            "uncertainty": {
-                "epistemic": epistemic,
-                "aleatoric": float(entropy),
-                "total_entropy": float(max(epistemic, entropy)),
-            },
+            "uncertainty": uncertainty,
             "likelihoods": {
                 "p_obs_given_attack": float(p_obs_given_attack),
                 "p_obs_given_clean": float(p_obs_given_clean),
@@ -190,7 +248,8 @@ class WGANGPAgent:
             "cost": self.cost,
             "agent_id": self.agent_id,
             "metadata": {
-                "model": "wgan_gp_tabular_autoencoder",
+                "model": "wgan_gp",
+                "model_type": self.model_type,
                 "model_path": str(self.model_path),
                 "anomaly_score": score,
                 "threshold_probability": self.threshold_probability,

@@ -4,7 +4,7 @@ orchestration:
   update_mode: posterior_first
   engine: deterministic
   first_agent_strategy: dynamic_cheapest
-  agent_sequence: [ocsvm, lstm_autoencoder, wgan_gp]
+  agent_sequence: [ocsvm, lstm_autoencoder]
 
 belief:
   prior_attack_rate: 0.5
@@ -13,6 +13,8 @@ belief:
 
 fusion:
   method: handoff_latest
+  uncertainty_weight_gamma: 1.5
+  weight_floor: 0.1
   agent_weights:
     ocsvm: 1.0
     lstm_autoencoder: 1.0
@@ -24,32 +26,40 @@ decision:
     c_fn: 500.0
     c_fp: 20.0
     c_h: 1000.0
+  defer_policy:
+    enabled: true
+    uncertainty_threshold: 0.66
+    margin_from_half: 0.08
+    require_all_agents_exhausted: true
   accuracy_floor_delta: 0.01
   cost_calibration:
     enabled: false
     mode: validation_derived
     fusion_method: handoff_latest
-    c_fn_grid: [25.0, 50.0, 100.0, 200.0, 500.0]
-    c_fp_grid: [1.0, 2.0, 5.0, 10.0]
-    c_h_grid: [100.0, 500.0, 1000.0, 5000.0]
-    min_expected_gain_grid: [0.0, -0.5, -1.0, -2.0, -3.0, -5.0, -10.0]
-    max_agents_grid: [1, 2, 3]
+    c_fn_grid: [25.0, 50.0, 100.0, 200.0]
+    c_fp_grid: [0.5, 1.0, 2.0, 5.0]
+    c_h_grid: [1.0, 2.0, 5.0, 10.0, 20.0]
+    min_expected_gain_grid: [-2.6, -2.7, -2.8, -2.9, -3.0]
+    max_agents_grid: [2]
+    uncertainty_threshold_grid: [0.60, 0.62, 0.64]
+    defer_uncertainty_threshold_grid: [0.65, 0.66, 0.67]
+    defer_margin_grid: [0.06, 0.08, 0.10]
 
 query:
   policy: adaptive_router
   first_agent: ocsvm
-  uncertainty_threshold: 0.646
+  uncertainty_threshold: 0.62
   apply_uncertainty_gate_in_adaptive: true
-  max_agents: 3
-  min_expected_gain: -0.5
+  max_agents: 2
+  min_expected_gain: -2.9
   force_under_target_topup: false
   exploration_enabled: false
   exploration_seed: 7
   exploration_base_rate: 0.0
   exploration_max_rate: 0.0
-  exploration_uncertainty_threshold: 0.646
+  exploration_uncertainty_threshold: 0.62
   escalation_ordered: true
-  utilization_warmup_flows: 500
+  utilization_warmup_flows: 0
   utilization_targets: []
 
 voi:
@@ -67,6 +77,7 @@ routing:
 benchmark:
   reset_state: true
   prediction_source: decision
+  utility_evaluation: cost_action_parity
   write_manifest: true
 
 preprocessing:

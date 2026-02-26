@@ -32,6 +32,27 @@ def _vectorize(num: np.ndarray, cat: np.ndarray, cat_cardinalities: list[int]) -
     return np.concatenate([num, cat_oh], axis=1)
 
 
+def _build_density_model(scores: np.ndarray, bins: int = 128) -> dict[str, list[float]]:
+    vals = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if vals.size == 0:
+        return {"bin_edges": [0.0, 1.0], "density": [1.0]}
+
+    lo = float(np.min(vals))
+    hi = float(np.max(vals))
+    if hi <= lo:
+        hi = lo + 1e-6
+    counts, edges = np.histogram(vals, bins=max(16, int(bins)), range=(lo, hi))
+    counts = counts.astype(np.float64)
+    max_count = float(np.max(counts)) if counts.size > 0 else 1.0
+    if max_count <= 0.0:
+        max_count = 1.0
+    density = (counts / max_count).tolist()
+    return {
+        "bin_edges": [float(x) for x in edges.tolist()],
+        "density": [float(x) for x in density],
+    }
+
+
 def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> None:
     cfg = load_agent_training_config(config_path)
     shared = dict(cfg.get("shared", {}))
@@ -141,8 +162,10 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "mal_mean": float(np.mean(malicious)),
             "mal_std": float(np.std(malicious) + 1e-9),
         },
+        "density_model": _build_density_model(best_scores),
         "model_config": best_cfg,
         "meta": {
+            "model_type": "one_class_svm",
             "dataset": str(dataset),
             "rows": int(len(df)),
             "train_rows": int(len(train_df)),

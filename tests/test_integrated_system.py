@@ -49,6 +49,7 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
         profile_path: str | None = None,
         costs: Dict[str, float] | None = None,
         query_overrides: Dict[str, object] | None = None,
+        decision_overrides: Dict[str, object] | None = None,
     ) -> Path:
         ids = list(dict.fromkeys(sequence or ["agent_a", "agent_b"]))
         if len(ids) < 2:
@@ -103,6 +104,21 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
         if query_overrides:
             query_cfg.update(query_overrides)
 
+        decision_cfg = {
+            "policy": "expected_cost_min",
+            "costs": {"c_fn": 500.0, "c_fp": 5.0, "c_h": 5000.0},
+            "defer_policy": {
+                "enabled": True,
+                "uncertainty_threshold": 0.66,
+                "margin_from_half": 0.08,
+                "require_all_agents_exhausted": True,
+            },
+            "accuracy_floor_delta": 0.01,
+            "cost_calibration": {"enabled": False, "mode": "validation_derived"},
+        }
+        if decision_overrides:
+            decision_cfg.update(decision_overrides)
+
         cfg = {
             "orchestration": {
                 "seed": 7,
@@ -118,12 +134,7 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
                 "likelihood_sanity_gate": True,
             },
             "fusion": {"method": fusion_method, "agent_weights": {}},
-            "decision": {
-                "policy": "expected_cost_min",
-                "costs": {"c_fn": 500.0, "c_fp": 5.0, "c_h": 5000.0},
-                "accuracy_floor_delta": 0.01,
-                "cost_calibration": {"enabled": False, "mode": "validation_derived"},
-            },
+            "decision": decision_cfg,
             "query": query_cfg,
             "voi": {"enabled": False, "rho": 0.7},
             "routing": {
@@ -464,6 +475,45 @@ class IntegratedSystemTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertAlmostEqual(float(res["compromise_prob"]), 0.83, places=12)
+
+    async def test_defer_policy_applies_when_all_agents_uncertain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._write_files(
+                Path(td),
+                sequence=["agent_a", "agent_b"],
+                max_agents=2,
+                query_policy="adaptive_router",
+                fusion_method="handoff_latest",
+                first_agent="agent_a",
+                min_expected_gain=-100.0,
+                query_overrides={
+                    "apply_uncertainty_gate_in_adaptive": False,
+                    "exploration_enabled": False,
+                    "force_under_target_topup": False,
+                    "utilization_targets": [],
+                },
+                decision_overrides={
+                    "defer_policy": {
+                        "enabled": True,
+                        "uncertainty_threshold": 0.66,
+                        "margin_from_half": 0.1,
+                        "require_all_agents_exhausted": True,
+                    }
+                },
+            )
+            system = IntegratedBAOSystem(cfg_path)
+            fake = _FakeA2A({"agent_a": [0.5], "agent_b": [0.5]})
+            system.a2a = fake
+
+            res = await system.process_flow(
+                flow_features={"packet_count": 10.0},
+                flow_id="flow-defer",
+                timestamp=time.time(),
+                true_label=0,
+            )
+
+            self.assertEqual(res["action_decision"], "defer")
+            self.assertEqual(res["agents_queried"], ["agent_a", "agent_b"])
 
 
 if __name__ == "__main__":

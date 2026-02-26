@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from agents.common.streaming import derive_stream_id
 from orchestrator.belief_state import BeliefStateManager
 from orchestrator.config import OrchestratorConfig, load_orchestrator_config
 from orchestrator.control.registry import load_registry, to_runtime_handles
@@ -16,6 +18,7 @@ from orchestrator.data_plane.state_sqlite import SQLiteStateBackend
 from orchestrator.decision import (
     DecisionCosts,
     approximate_voi,
+    expected_action_costs,
     realized_action_cost,
     select_expected_cost_action,
 )
@@ -81,6 +84,9 @@ class IntegratedBAOSystem:
 
         self.query_policy = self.config_obj.query.policy
         self.fusion_method = self.config_obj.fusion.method
+        self.uncertainty_weight_gamma = float(self.config_obj.fusion.uncertainty_weight_gamma)
+        self.weight_floor = float(self.config_obj.fusion.weight_floor)
+        self.defer_policy = self.config_obj.decision.defer_policy
         self.engine = self.config_obj.orchestration.engine
         self.router: Optional[AdaptiveRouter] = None
         if self.query_policy == "adaptive_router":
@@ -214,6 +220,10 @@ class IntegratedBAOSystem:
         return []
 
     def _build_payload(self, flow_id: str, timestamp: float, flow_features: Dict[str, Any], p_mal: float, uncertainty: float) -> Dict[str, Any]:
+        stream_id = derive_stream_id(
+            flow_features=flow_features,
+            flow_id=flow_id,
+        )
         return {
             "request_id": str(uuid.uuid4()),
             "flow_id": flow_id,
@@ -224,6 +234,7 @@ class IntegratedBAOSystem:
                 "requested_capabilities": list(flow_features.get("required_capabilities", [])),
                 "elicit_likelihood": True,
                 "seed": int(self.config_obj.orchestration.seed),
+                "stream_id": stream_id,
             },
         }
 
@@ -231,6 +242,12 @@ class IntegratedBAOSystem:
         p = float(value)
         eps = self.config_obj.belief.eps
         return max(eps, min(1.0 - eps, p))
+
+    def _combined_uncertainty_nats(self, *, belief_entropy: float, agent_epistemic: float) -> float:
+        # Belief entropy is in nats [0, ln 2], while agent epistemic is normalized [0,1].
+        be = max(0.0, min(math.log(2.0), float(belief_entropy)))
+        ae = max(0.0, min(1.0, float(agent_epistemic))) * math.log(2.0)
+        return max(be, ae)
 
     def _query_single_agent(
         self,
@@ -260,6 +277,11 @@ class IntegratedBAOSystem:
 
         p_agent = self._clip_probability((output.get("proba") or [0.5, 0.5])[1])
         output["proba"] = [1.0 - p_agent, p_agent]
+        out_uncertainty = dict(output.get("uncertainty") or {})
+        agent_epistemic = max(0.0, min(1.0, float(out_uncertainty.get("epistemic", 0.5))))
+        effective_weight = (
+            self._agent_weight(aid) * ((1.0 - agent_epistemic) ** self.uncertainty_weight_gamma)
+        ) + self.weight_floor
 
         updated, fusion_note = apply_fusion_update(
             belief=belief,
@@ -270,7 +292,7 @@ class IntegratedBAOSystem:
             queried_probabilities=queried_probabilities,
             fusion_method=self.fusion_method,
             update_mode=self.config_obj.orchestration.update_mode,
-            agent_weight=self._agent_weight(aid),
+            agent_weight=effective_weight,
             eps=self.config_obj.belief.eps,
             likelihood_sanity_gate=self.config_obj.belief.likelihood_sanity_gate,
             decision_costs=self.decision_costs,
@@ -284,11 +306,16 @@ class IntegratedBAOSystem:
         state["belief_var"] = float(updated["var"])
         state["compromise_prob"] = float(updated["compromise_prob"])
         state["epistemic_uncertainty"] = float(updated["epistemic_uncertainty"])
+        state["last_agent_epistemic"] = float(agent_epistemic)
+        state["combined_uncertainty"] = self._combined_uncertainty_nats(
+            belief_entropy=float(updated["epistemic_uncertainty"]),
+            agent_epistemic=float(agent_epistemic),
+        )
         state["confidence"] = max(state["compromise_prob"], 1.0 - state["compromise_prob"])
 
         self.metrics["agent_calls"][aid] = self.metrics["agent_calls"].get(aid, 0) + 1
         state["decision_reasoning"].append(
-            f"agent={aid},p_agent={p_agent:.6f},p_post={state['compromise_prob']:.6f},h={state['epistemic_uncertainty']:.6f},fusion={fusion_note}"
+            f"agent={aid},p_agent={p_agent:.6f},p_post={state['compromise_prob']:.6f},h={state['epistemic_uncertainty']:.6f},h_combined={state['combined_uncertainty']:.6f},w_eff={effective_weight:.6f},fusion={fusion_note}"
         )
         return True
 
@@ -300,7 +327,7 @@ class IntegratedBAOSystem:
         true_label: Optional[int] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        features = dict(flow_features)
+        features = self.preprocessor.transform(dict(flow_features))
 
         candidates = self._candidate_agents(features)
         belief = self.belief_manager.get_or_create_belief(
@@ -331,6 +358,11 @@ class IntegratedBAOSystem:
             "belief_var": belief.get_variance(),
             "compromise_prob": belief.get_compromise_prob(),
             "epistemic_uncertainty": belief.get_epistemic_uncertainty(),
+            "last_agent_epistemic": 0.5,
+            "combined_uncertainty": self._combined_uncertainty_nats(
+                belief_entropy=belief.get_epistemic_uncertainty(),
+                agent_epistemic=0.5,
+            ),
             "inference_time_ms": 0.0,
             "total_time_ms": 0.0,
             "confidence": max(belief.get_compromise_prob(), 1.0 - belief.get_compromise_prob()),
@@ -362,7 +394,7 @@ class IntegratedBAOSystem:
                 next_agent = candidates[idx + 1]
                 should_query, voi_value = self._query_decision_strict(
                     p_mal=state["compromise_prob"],
-                    uncertainty=state["epistemic_uncertainty"],
+                    uncertainty=state["combined_uncertainty"],
                     next_agent_cost=float(self.agent_handles[next_agent].cost),
                 )
                 state["voi_scores"][next_agent] = float(voi_value)
@@ -407,7 +439,7 @@ class IntegratedBAOSystem:
                         targets=self.utilization_targets,
                         warmup_flows=self.utilization_warmup_flows,
                     )
-                    uncertainty = float(state["epistemic_uncertainty"])
+                    uncertainty = float(state["combined_uncertainty"])
                     uncertainty_allows_exploration = uncertainty > float(self.exploration_uncertainty_threshold)
                     if self.apply_uncertainty_gate_in_adaptive and uncertainty <= float(self.config_obj.query.uncertainty_threshold):
                         if not self.force_under_target_topup:
@@ -469,6 +501,29 @@ class IntegratedBAOSystem:
         final_p = float(belief.get_compromise_prob())
         action_decision, action_costs = select_expected_cost_action(final_p, self.decision_costs)
         classification_decision = classify_from_probability(final_p)
+        final_combined_uncertainty = self._combined_uncertainty_nats(
+            belief_entropy=float(belief.get_epistemic_uncertainty()),
+            agent_epistemic=float(state.get("last_agent_epistemic", 0.5)),
+        )
+        state["combined_uncertainty"] = final_combined_uncertainty
+
+        if bool(self.defer_policy.enabled):
+            exhausted = len(state["agents_queried"]) >= len(candidates)
+            defer_allowed = (not bool(self.defer_policy.require_all_agents_exhausted)) or exhausted
+            if (
+                defer_allowed
+                and final_combined_uncertainty >= float(self.defer_policy.uncertainty_threshold)
+                and abs(final_p - 0.5) <= float(self.defer_policy.margin_from_half)
+            ):
+                action_decision = "defer"
+                action_costs = expected_action_costs(final_p, self.decision_costs)
+                state["decision_reasoning"].append(
+                    "defer_override=true,"
+                    f"h_combined={final_combined_uncertainty:.6f},"
+                    f"threshold={float(self.defer_policy.uncertainty_threshold):.6f},"
+                    f"margin={float(self.defer_policy.margin_from_half):.6f},"
+                    f"exhausted={str(exhausted).lower()}"
+                )
 
         state["decision"] = classification_decision
         state["action_decision"] = action_decision
@@ -527,6 +582,7 @@ class IntegratedBAOSystem:
             "action_decision": action_decision,
             "compromise_prob": state["compromise_prob"],
             "epistemic_uncertainty": state["epistemic_uncertainty"],
+            "combined_uncertainty": state["combined_uncertainty"],
             "cumulative_cost": state["cumulative_cost"],
             "agents_queried": state["agents_queried"],
             "voi_scores": state["voi_scores"],
@@ -587,6 +643,7 @@ class IntegratedBAOSystem:
             "action_cost_total": action_total,
             "utility_cost_total": utility_total,
             "hitl_count": self.metrics["hitl_count"],
+            "defer_rate": float(self.metrics["hitl_count"]) / float(n),
             "query_policy": self.query_policy,
             "fusion_method": self.fusion_method,
             "agent_utilization": util_rates,

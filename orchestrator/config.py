@@ -16,6 +16,7 @@ CALIBRATION_MODES = {"validation_derived"}
 PREDICTION_SOURCES = {"decision", "probability"}
 ORCHESTRATION_ENGINES = {"deterministic", "langgraph"}
 FIRST_AGENT_STRATEGIES = {"dynamic_cheapest", "explicit"}
+UTILITY_EVALUATIONS = {"cost_action_parity", "legacy_mixed"}
 logger = logging.getLogger("orchestrator.config")
 
 
@@ -39,6 +40,8 @@ class BeliefConfig:
 @dataclass(frozen=True)
 class FusionConfig:
     method: str
+    uncertainty_weight_gamma: float
+    weight_floor: float
     agent_weights: Dict[str, float] = field(default_factory=dict)
 
 
@@ -51,7 +54,18 @@ class CostCalibrationConfig:
     c_h_grid: list[float] = field(default_factory=list)
     min_expected_gain_grid: list[float] = field(default_factory=list)
     max_agents_grid: list[int] = field(default_factory=list)
+    uncertainty_threshold_grid: list[float] = field(default_factory=list)
+    defer_uncertainty_threshold_grid: list[float] = field(default_factory=list)
+    defer_margin_grid: list[float] = field(default_factory=list)
     fusion_method: str = "handoff_latest"
+
+
+@dataclass(frozen=True)
+class DeferPolicyConfig:
+    enabled: bool
+    uncertainty_threshold: float
+    margin_from_half: float
+    require_all_agents_exhausted: bool
 
 
 @dataclass(frozen=True)
@@ -61,6 +75,7 @@ class DecisionConfig:
     c_fp: float
     c_h: float
     accuracy_floor_delta: float
+    defer_policy: DeferPolicyConfig
     cost_calibration: CostCalibrationConfig
 
 
@@ -112,6 +127,7 @@ class UtilizationTargetConfig:
 class BenchmarkConfig:
     reset_state: bool
     prediction_source: str
+    utility_evaluation: str
     write_manifest: bool
 
 
@@ -294,6 +310,10 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     fusion_method = str(fusion_raw.get("method", "logit_pool")).strip().lower()
     if fusion_method not in FUSION_METHODS:
         raise ValueError(f"unsupported fusion.method={fusion_method!r}")
+    uncertainty_weight_gamma = _to_float(fusion_raw.get("uncertainty_weight_gamma", 1.5), 1.5)
+    uncertainty_weight_gamma = max(0.0, uncertainty_weight_gamma)
+    weight_floor = _to_float(fusion_raw.get("weight_floor", 0.1), 0.1)
+    weight_floor = max(0.0, weight_floor)
 
     query_policy = str(query_raw.get("policy", "strict_cascade")).strip().lower()
     if query_policy not in QUERY_POLICIES:
@@ -302,6 +322,9 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     prediction_source = str(benchmark_raw.get("prediction_source", "decision")).strip().lower()
     if prediction_source not in PREDICTION_SOURCES:
         raise ValueError(f"unsupported benchmark.prediction_source={prediction_source!r}")
+    utility_evaluation = str(benchmark_raw.get("utility_evaluation", "cost_action_parity")).strip().lower()
+    if utility_evaluation not in UTILITY_EVALUATIONS:
+        raise ValueError(f"unsupported benchmark.utility_evaluation={utility_evaluation!r}")
 
     rho = _to_float(voi_raw.get("rho", 0.7), 0.7)
     rho = max(0.0, min(1.0, rho))
@@ -384,6 +407,16 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         raise ValueError(f"unsupported decision.cost_calibration.fusion_method={cost_cal_fusion!r}")
     accuracy_floor_delta = _to_float(decision_raw.get("accuracy_floor_delta", 0.01), 0.01)
     accuracy_floor_delta = max(0.0, min(1.0, accuracy_floor_delta))
+    defer_raw = dict(decision_raw.get("defer_policy", {}) or {})
+    defer_uncertainty_threshold = _to_float(defer_raw.get("uncertainty_threshold", 0.66), 0.66)
+    defer_uncertainty_threshold = max(0.0, min(0.69314718056, defer_uncertainty_threshold))
+    defer_margin_from_half = _to_float(defer_raw.get("margin_from_half", 0.08), 0.08)
+    defer_margin_from_half = max(0.0, min(0.5, defer_margin_from_half))
+    defer_enabled = _to_bool(defer_raw.get("enabled", True), True)
+    defer_require_all_agents_exhausted = _to_bool(
+        defer_raw.get("require_all_agents_exhausted", True),
+        True,
+    )
     decision_costs_raw = decision_raw.get("costs", {})
     decision_costs = dict(decision_costs_raw) if isinstance(decision_costs_raw, Mapping) else {}
     c_fn_raw = decision_costs.get("c_fn", legacy_costs.get("c_fn"))
@@ -434,13 +467,24 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
             eps=eps,
             likelihood_sanity_gate=_to_bool(belief_raw.get("likelihood_sanity_gate", True), True),
         ),
-        fusion=FusionConfig(method=fusion_method, agent_weights=weights),
+        fusion=FusionConfig(
+            method=fusion_method,
+            uncertainty_weight_gamma=uncertainty_weight_gamma,
+            weight_floor=weight_floor,
+            agent_weights=weights,
+        ),
         decision=DecisionConfig(
             policy=str(decision_raw.get("policy", "expected_cost_min")).strip().lower(),
             c_fn=c_fn,
             c_fp=c_fp,
             c_h=c_h,
             accuracy_floor_delta=accuracy_floor_delta,
+            defer_policy=DeferPolicyConfig(
+                enabled=defer_enabled,
+                uncertainty_threshold=defer_uncertainty_threshold,
+                margin_from_half=defer_margin_from_half,
+                require_all_agents_exhausted=defer_require_all_agents_exhausted,
+            ),
             cost_calibration=CostCalibrationConfig(
                 enabled=_to_bool(cost_cal_raw.get("enabled", False), False),
                 mode=cost_cal_mode,
@@ -449,6 +493,11 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 c_h_grid=_as_list_of_float(cost_cal_raw.get("c_h_grid", [])),
                 min_expected_gain_grid=_as_list_of_float(cost_cal_raw.get("min_expected_gain_grid", [])),
                 max_agents_grid=_as_list_of_int(cost_cal_raw.get("max_agents_grid", [])),
+                uncertainty_threshold_grid=_as_list_of_float(cost_cal_raw.get("uncertainty_threshold_grid", [])),
+                defer_uncertainty_threshold_grid=_as_list_of_float(
+                    cost_cal_raw.get("defer_uncertainty_threshold_grid", [])
+                ),
+                defer_margin_grid=_as_list_of_float(cost_cal_raw.get("defer_margin_grid", [])),
                 fusion_method=cost_cal_fusion,
             ),
         ),
@@ -484,6 +533,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         benchmark=BenchmarkConfig(
             reset_state=_to_bool(benchmark_raw.get("reset_state", True), True),
             prediction_source=prediction_source,
+            utility_evaluation=utility_evaluation,
             write_manifest=_to_bool(benchmark_raw.get("write_manifest", True), True),
         ),
         a2a=A2AConfig(retries=_to_int(a2a_raw.get("retries", 0), 0)),
