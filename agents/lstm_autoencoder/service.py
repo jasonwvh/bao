@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
 from collections import OrderedDict, deque
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+import uvicorn
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 from torch import nn
 
 from agents.common.calibration import (
@@ -24,6 +25,22 @@ from agents.common.streaming import derive_stream_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("lstm_autoencoder")
+
+
+class InferContext(BaseModel):
+    belief: Dict[str, float] = Field(default_factory=dict)
+    requested_capabilities: list[str] = Field(default_factory=list)
+    seed: Optional[int] = None
+    stream_id: Optional[str] = None
+    elicit_likelihood: Optional[bool] = True
+
+
+class InferRequest(BaseModel):
+    request_id: str
+    flow_id: str
+    timestamp: float
+    flow_features: Dict[str, Any]
+    context: InferContext = Field(default_factory=InferContext)
 
 
 class SequenceLSTMAutoencoder(nn.Module):
@@ -257,57 +274,37 @@ AGENT = LSTMAutoencoderAgent(
     cost=float(os.getenv("AGENT_COST", "3.0")),
 )
 
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/a2a/health":
-            return self._send({"status": "ok", "agent_id": AGENT.agent_id, "version": "v1"})
-        if self.path == "/a2a/capabilities":
-            return self._send(
-                {
-                    "agent_id": AGENT.agent_id,
-                    "capabilities": ["flow_tabular", "unsw_nb15", "deep_inspection", "anomaly_score", "temporal"],
-                    "cost": AGENT.cost,
-                }
-            )
-        self.send_error(404)
-
-    def do_POST(self):
-        if self.path != "/a2a/infer":
-            return self.send_error(404)
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
-        payload = json.loads(body.decode("utf-8") or "{}")
-
-        feats = payload.get("flow_features", {})
-        ctx = payload.get("context", {})
-        seed = ctx.get("seed")
-        stream_id = ctx.get("stream_id")
-        out = AGENT.predict_with_uncertainty(
-            feats,
-            seed=seed,
-            flow_id=payload.get("flow_id"),
-            stream_id=stream_id,
-        )
-        return self._send(out)
-
-    def _send(self, payload):
-        data = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, format, *args):
-        return
+app = FastAPI(title="lstm-autoencoder-agent", version="v1")
 
 
-def main():
+@app.get("/a2a/health")
+def health() -> Dict[str, Any]:
+    return {"status": "ok", "agent_id": AGENT.agent_id, "version": "v1"}
+
+
+@app.get("/a2a/capabilities")
+def capabilities() -> Dict[str, Any]:
+    return {
+        "agent_id": AGENT.agent_id,
+        "capabilities": ["flow_tabular", "unsw_nb15", "deep_inspection", "anomaly_score", "temporal"],
+        "cost": AGENT.cost,
+    }
+
+
+@app.post("/a2a/infer")
+def infer(req: InferRequest) -> Dict[str, Any]:
+    return AGENT.predict_with_uncertainty(
+        req.flow_features,
+        seed=req.context.seed,
+        flow_id=req.flow_id,
+        stream_id=req.context.stream_id,
+    )
+
+
+def main() -> None:
     port = int(os.getenv("PORT", "8082"))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    logger.info(f"Starting LSTM-autoencoder agent server on port {port}...")
-    server.serve_forever()
+    logger.info("Starting LSTM-autoencoder agent server on port %s", port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

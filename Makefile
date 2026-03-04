@@ -1,4 +1,4 @@
-.PHONY: build up down train-ocsvm train-lstm-autoencoder train-wgan-gp train health logs clean
+.PHONY: build up down train-ocsvm train-lstm-autoencoder train-wgan-gp train health logs clean benchmark
 
 DATASET ?= data/UNSW_NB15_training-set.csv
 
@@ -31,5 +31,8 @@ health:
 logs:
 	docker compose logs -f
 
+benchmark:
+	python3 benchmark.py --mode all --dataset data/UNSW_NB15_testing-set.csv --config config/orchestrator_config.utility.yaml
+
 clean:
-	rm -rf artifacts/replay/*.jsonl artifacts/replay/*.json artifacts/replay/*.yaml artifacts/state/*.sqlite
+	rm -rf artifacts/runs

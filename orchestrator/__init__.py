@@ -1,5 +1,3 @@
-"""Orchestrator package."""
+from orchestrator.runtime import BAORuntime
 
-from .integrated_system import IntegratedBAOSystem
-
-__all__ = ["IntegratedBAOSystem"]
+__all__ = ["BAORuntime"]
