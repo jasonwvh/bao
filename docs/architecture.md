@@ -21,17 +21,23 @@ Default sequence is ordered by config (typically `ocsvm -> lstm_autoencoder -> w
 
 Per flow:
 1. Query first agent.
-2. Update posterior from agent probability.
+2. Update posterior with likelihood-ratio Bayesian update:
+   `logit(p_t) = logit(p_{t-1}) + k_i * log(p(obs|attack)/p(obs|clean))`
+   where `k_i` is reliability-scaled; fallback is probability pooling if likelihoods are invalid.
 3. Compute combined uncertainty.
 4. If uncertainty low, stop.
-5. If uncertainty high and next agent exists, apply VOI gate against next-agent cost.
+5. If uncertainty high and next agent exists, apply VOI gate:
+   `expected_cost_reduction - next_agent_cost >= min_net_gain`.
 6. Query next agent only if VOI gain passes threshold.
 7. Finalize decision via expected action cost.
 8. If all agents exhausted and uncertainty remains high near 0.5, defer.
 
+## Session isolation
+Agent calls include `context.session_id` so stateful sequence models (LSTM stream buffers) stay isolated per benchmark pass and do not leak baseline history into BAO routing/evaluation.
+
 ## Benchmark interface
 Single entrypoint:
-- `benchmark.py --mode bao|agent|all`
+- `main.py --mode bao|agent|all`
 
 Each run writes exactly:
 - `benchmark.json`

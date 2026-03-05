@@ -19,6 +19,7 @@ from agents.common.calibration import (
     logistic_probability,
     normalize_uncertainty,
 )
+from agents.common.versioning import collect_library_versions, compare_versions
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("ocsvm")
@@ -29,6 +30,7 @@ class InferContext(BaseModel):
     requested_capabilities: list[str] = Field(default_factory=list)
     seed: Optional[int] = None
     stream_id: Optional[str] = None
+    session_id: Optional[str] = None
     elicit_likelihood: Optional[bool] = True
 
 
@@ -73,6 +75,19 @@ class OCSVMAgent:
 
         self.cat_cardinalities = [int(x) for x in payload.get("cat_cardinalities", [])]
         self.score_stats = payload.get("score_stats", {})
+        self.model_meta = dict(payload.get("meta") or {})
+        self.model_library_versions = dict(self.model_meta.get("library_versions") or {})
+        self.runtime_library_versions = collect_library_versions()
+        versions_match, version_mismatches = compare_versions(
+            expected=self.model_library_versions,
+            actual=self.runtime_library_versions,
+        )
+        self.version_check = {
+            "versions_match": bool(versions_match),
+            "mismatches": list(version_mismatches),
+        }
+        if not versions_match:
+            logger.warning("Model/service version mismatch detected: %s", "; ".join(version_mismatches))
         density_model = payload.get("density_model", {})
         self.density_bin_edges = np.asarray(density_model.get("bin_edges", []), dtype=np.float64)
         self.density_values = np.asarray(density_model.get("density", []), dtype=np.float64)
@@ -164,16 +179,23 @@ class OCSVMAgent:
         epistemic = float(max(class_uncertainty, ood_uncertainty))
         uncertainty = normalize_uncertainty(epistemic=epistemic, aleatoric=entropy)
 
-        p_obs_given_attack = self._pdf(
+        raw_attack = self._pdf(
             anomaly_score,
             float(self.score_stats.get("mal_mean", self.score_stats.get("mean", 0.0))),
             float(self.score_stats.get("mal_std", self.score_stats.get("std", 1.0))),
         )
-        p_obs_given_clean = self._pdf(
+        raw_clean = self._pdf(
             anomaly_score,
             float(self.score_stats.get("benign_mean", self.score_stats.get("mean", 0.0))),
             float(self.score_stats.get("benign_std", self.score_stats.get("std", 1.0))),
         )
+        raw_sum = max(1e-9, raw_attack + raw_clean)
+        score_attack = raw_attack / raw_sum
+        score_clean = raw_clean / raw_sum
+
+        # Keep likelihood-ratio updates aligned with calibrated posterior behavior.
+        p_obs_given_attack = max(1e-9, 0.7 * p + 0.3 * score_attack)
+        p_obs_given_clean = max(1e-9, 0.7 * (1.0 - p) + 0.3 * score_clean)
 
         label = "malicious" if p >= 0.5 else "benign"
         return {
@@ -195,6 +217,8 @@ class OCSVMAgent:
                 "threshold_aligned": 0.5,
                 "ood_local_density": local_density,
                 "ood_uncertainty": ood_uncertainty,
+                "raw_score_likelihood_attack": raw_attack,
+                "raw_score_likelihood_clean": raw_clean,
             },
         }
 
@@ -219,6 +243,12 @@ def capabilities() -> Dict[str, Any]:
         "agent_id": AGENT.agent_id,
         "capabilities": ["flow_tabular", "unsw_nb15", "anomaly_score", "one_class"],
         "cost": AGENT.cost,
+        "metadata": {
+            "model_type": "one_class_svm",
+            "runtime_library_versions": AGENT.runtime_library_versions,
+            "model_library_versions": AGENT.model_library_versions,
+            "version_check": AGENT.version_check,
+        },
     }
 
 

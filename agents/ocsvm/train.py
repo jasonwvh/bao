@@ -8,9 +8,10 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.svm import OneClassSVM
 
-from agents.common.calibration import fit_logistic_calibrator, logistic_probability, select_probability_threshold
+from agents.common.calibration import fit_best_calibrator
 from agents.common.preprocessing import fit_preprocessor, load_csv, transform_frame
 from agents.common.training_config import load_agent_training_config
+from agents.common.versioning import collect_library_versions
 
 
 def _vectorize(num: np.ndarray, cat: np.ndarray, cat_cardinalities: list[int]) -> np.ndarray:
@@ -117,6 +118,10 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
     best_calibrator = None
     best_threshold = 0.5
     best_ba = -1.0
+    best_ece = 1.0
+    best_brier = 1.0
+    best_selected_calibrator = "logistic"
+    best_calibration_diagnostics = []
     best_scores = None
     best_cfg = None
 
@@ -125,11 +130,24 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             model = OneClassSVM(kernel="rbf", nu=float(nu), gamma=gamma)
             model.fit(x_train_normal)
             scores_cal = -model.decision_function(x_cal)
-            calibrator = fit_logistic_calibrator(scores_cal, y_cal, seed=seed)
-            probs_cal = logistic_probability(scores_cal, calibrator, clip_lo=p_lo, clip_hi=p_hi)
-            thr, ba = select_probability_threshold(np.asarray(probs_cal), y_cal)
+            calibration_best = fit_best_calibrator(
+                scores=np.asarray(scores_cal),
+                labels=np.asarray(y_cal),
+                seed=int(seed),
+                clip_lo=float(p_lo),
+                clip_hi=float(p_hi),
+            )
+            calibrator = calibration_best["calibrator"]
+            ba = float(calibration_best["balanced_accuracy"])
+            ece = float(calibration_best["ece"])
+            brier = float(calibration_best["brier"])
+            thr = float(calibration_best["threshold_probability"])
             if ba > best_ba:
                 best_ba = float(ba)
+                best_ece = float(ece)
+                best_brier = float(brier)
+                best_selected_calibrator = str(calibration_best["selected"])
+                best_calibration_diagnostics = list(calibration_best["diagnostics"])
                 best_model = model
                 best_calibrator = calibrator
                 best_threshold = float(thr)
@@ -146,9 +164,17 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
     benign = best_scores[y_cal == 0] if np.any(y_cal == 0) else best_scores
     malicious = best_scores[y_cal == 1] if np.any(y_cal == 1) else best_scores
 
+    model_versions = collect_library_versions()
     payload = {
         "model": best_model,
         "calibrator": best_calibrator,
+        "selected_calibrator": str(best_selected_calibrator),
+        "calibration_diagnostics": list(best_calibration_diagnostics),
+        "calibration_metrics": {
+            "balanced_accuracy": float(best_ba),
+            "ece": float(best_ece),
+            "brier": float(best_brier),
+        },
         "threshold_probability": best_threshold,
         "probability_clip": [p_lo, p_hi],
         "preprocessor": pre.to_dict(),
@@ -174,6 +200,9 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "seed": int(seed),
             "validation_fraction": float(val_fraction),
             "best_balanced_accuracy": float(best_ba),
+            "calibration_ece": float(best_ece),
+            "calibration_brier": float(best_brier),
+            "library_versions": model_versions,
         },
     }
 

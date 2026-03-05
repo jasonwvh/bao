@@ -7,12 +7,13 @@ from typing import Any, Dict, List, Optional
 
 from agents.common.streaming import derive_stream_id
 from orchestrator.a2a import A2AClient, A2AClientError, AgentHandle, load_registry
-from orchestrator.belief import BeliefManager
+from orchestrator.belief import BeliefManager, reliability_weight_from_beta_params
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.data import DataAdapter
 from orchestrator.decisioning import (
     DecisionCosts,
     approximate_voi,
+    expected_cost_reduction,
     realized_action_cost,
     select_decision,
 )
@@ -39,6 +40,7 @@ class BAORuntime:
         self.beliefs = BeliefManager(self.state, eps=self.config.belief.eps)
         self.data = DataAdapter(schema_path=self.config.preprocessing.schema_path)
         self.a2a = A2AClient(retries=self.config.a2a.retries)
+        self.session_id = str(uuid.uuid4())
 
         self.agent_handles: Dict[str, AgentHandle] = load_registry(self.config.orchestration.agent_registry_path)
         self.agent_sequence = self._resolve_agent_sequence()
@@ -59,9 +61,12 @@ class BAORuntime:
                 "escalate": 0,
                 "stop": 0,
             },
+            "routing_expected_net_gain_total": 0.0,
+            "routing_expected_net_gain_count": 0,
             "query_cost_total": 0.0,
             "action_cost_total": 0.0,
             "utility_cost_total": 0.0,
+            "warnings": {},
         }
 
     def _resolve_agent_sequence(self) -> List[str]:
@@ -97,17 +102,73 @@ class BAORuntime:
         ae = max(0.0, min(1.0, float(agent_epistemic))) * math.log(2.0)
         return max(be, ae)
 
-    def _should_escalate(self, p_mal: float, combined_uncertainty: float, next_agent_cost: float) -> tuple[bool, float]:
+    def _record_warning(self, code: str, message: str) -> None:
+        if not bool(self.config.metrics.warnings_enabled):
+            return
+        key = str(code).strip() or "runtime_warning"
+        warnings_map = self.metrics["warnings"]
+        current = warnings_map.get(key)
+        if isinstance(current, dict):
+            current["count"] = int(current.get("count", 0)) + 1
+            current["message"] = str(current.get("message") or message)
+        else:
+            warnings_map[key] = {"code": key, "message": str(message), "count": 1}
+
+    def _extract_likelihoods(self, output: Dict[str, Any]) -> Optional[tuple[float, float]]:
+        likelihoods = dict(output.get("likelihoods") or {})
+        p_attack = likelihoods.get("p_obs_given_attack")
+        p_clean = likelihoods.get("p_obs_given_clean")
+        try:
+            p1 = float(p_attack)
+            p0 = float(p_clean)
+        except Exception:
+            return None
+        if not math.isfinite(p1) or not math.isfinite(p0):
+            return None
+        if p1 <= 0.0 or p0 <= 0.0:
+            return None
+        return (p1, p0)
+
+    def _next_agent_reliability(self, agent_id: str) -> float:
+        return max(0.0, min(1.0, float(self.beliefs.get_global_reliability(agent_id))))
+
+    def _expected_voi_value(self, p_mal: float, combined_uncertainty: float, next_agent_id: str) -> float:
+        if not bool(self.config.voi.enabled):
+            return 0.0
+        mode = str(self.config.voi.mode).strip().lower()
+        if mode == "legacy_approx":
+            return float(approximate_voi(p_mal, self.costs, rho=float(self.config.voi.rho)))
+
+        next_rel = self._next_agent_reliability(next_agent_id)
+        epistemic = max(0.0, min(1.0, float(combined_uncertainty) / math.log(2.0)))
+        return float(
+            expected_cost_reduction(
+                p_mal=p_mal,
+                costs=self.costs,
+                reliability=next_rel,
+                epistemic_uncertainty=epistemic,
+                rho=float(self.config.voi.rho),
+            )
+        )
+
+    def _should_escalate(
+        self,
+        *,
+        p_mal: float,
+        combined_uncertainty: float,
+        next_agent_cost: float,
+        next_agent_id: str,
+    ) -> tuple[bool, float]:
         if float(combined_uncertainty) <= float(self.config.query.uncertainty_threshold):
             return False, float("-inf")
 
-        if not bool(self.config.voi.enabled):
-            expected_gain = approximate_voi(p_mal, self.costs, rho=1.0) - float(next_agent_cost)
-        else:
-            voi = approximate_voi(p_mal, self.costs, rho=float(self.config.voi.rho))
-            expected_gain = float(voi) - float(next_agent_cost)
-
-        return expected_gain > float(self.config.query.min_expected_gain), float(expected_gain)
+        voi_value = self._expected_voi_value(
+            p_mal=float(p_mal),
+            combined_uncertainty=float(combined_uncertainty),
+            next_agent_id=next_agent_id,
+        )
+        expected_gain = float(voi_value) - float(next_agent_cost)
+        return expected_gain >= float(self.config.voi.min_net_gain), float(expected_gain)
 
     def _build_payload(self, flow_id: str, timestamp: float, flow_features: Dict[str, Any], p_mal: float, uncertainty: float) -> Dict[str, Any]:
         stream_id = derive_stream_id(flow_features=flow_features, flow_id=flow_id)
@@ -121,6 +182,7 @@ class BAORuntime:
                 "requested_capabilities": list(flow_features.get("required_capabilities", [])),
                 "seed": int(self.config.orchestration.seed),
                 "stream_id": stream_id,
+                "session_id": self.session_id,
                 "elicit_likelihood": True,
             },
         }
@@ -149,6 +211,7 @@ class BAORuntime:
         outputs: List[Dict[str, Any]] = []
         cumulative_cost = 0.0
         last_epistemic = 0.5
+        last_expected_net_gain = float("-inf")
         combined_uncertainty = self._combined_uncertainty_nats(belief.entropy(), last_epistemic)
         for idx, agent_id in enumerate(self.agent_sequence):
             handle = self.agent_handles[agent_id]
@@ -162,15 +225,41 @@ class BAORuntime:
 
             try:
                 output = self.a2a.infer(handle, payload)
-            except A2AClientError:
+            except A2AClientError as exc:
+                self._record_warning(
+                    "transport_failure",
+                    f"A2A infer failed for {agent_id}: {exc}",
+                )
                 continue
 
             p_agent = self._clip_probability((output.get("proba") or [0.5, 0.5])[1])
             out_uncertainty = dict(output.get("uncertainty") or {})
             last_epistemic = max(0.0, min(1.0, float(out_uncertainty.get("epistemic", 0.5))))
 
-            weight = self._agent_weight(agent_id, last_epistemic)
-            belief.update_from_agent_probability(p_agent, weight)
+            if str(self.config.belief.update_mode).strip().lower() == "likelihood_ratio":
+                likelihoods = self._extract_likelihoods(output)
+                if likelihoods is not None:
+                    alpha, beta = self.beliefs.get_global_reliability_params(agent_id)
+                    k_i = reliability_weight_from_beta_params(
+                        alpha=alpha,
+                        beta=beta,
+                        reliability_strength=float(self.config.belief.reliability_strength),
+                    )
+                    belief.update_from_likelihood_ratio(
+                        p_obs_given_attack=likelihoods[0],
+                        p_obs_given_clean=likelihoods[1],
+                        k=k_i,
+                    )
+                else:
+                    self._record_warning(
+                        "missing_or_invalid_likelihoods",
+                        f"{agent_id} response missing valid likelihoods; fallback to probability pooling",
+                    )
+                    weight = self._agent_weight(agent_id, last_epistemic)
+                    belief.update_from_agent_probability(p_agent, weight)
+            else:
+                weight = self._agent_weight(agent_id, last_epistemic)
+                belief.update_from_agent_probability(p_agent, weight)
             combined_uncertainty = self._combined_uncertainty_nats(belief.entropy(), last_epistemic)
 
             agents_queried.append(agent_id)
@@ -192,7 +281,12 @@ class BAORuntime:
                 p_mal=belief.probability(),
                 combined_uncertainty=combined_uncertainty,
                 next_agent_cost=float(self.agent_handles[next_agent].cost),
+                next_agent_id=next_agent,
             )
+            last_expected_net_gain = float(expected_gain)
+            if math.isfinite(float(expected_gain)):
+                self.metrics["routing_expected_net_gain_total"] += float(expected_gain)
+                self.metrics["routing_expected_net_gain_count"] += 1
             if should_escalate:
                 self.metrics["routing_selection_counts"]["escalate"] += 1
                 continue
@@ -238,6 +332,7 @@ class BAORuntime:
             "compromise_prob": float(final_p),
             "epistemic_uncertainty": float(belief.entropy()),
             "combined_uncertainty": float(combined_uncertainty),
+            "expected_net_gain": float(last_expected_net_gain),
             "agents_queried": list(agents_queried),
             "cumulative_cost": float(cumulative_cost),
         }
@@ -248,6 +343,13 @@ class BAORuntime:
             aid: float(calls) / float(n)
             for aid, calls in self.metrics["agent_calls"].items()
         }
+        routing_counts = dict(self.metrics["routing_selection_counts"])
+        routing_total = max(1, int(routing_counts.get("escalate", 0) + routing_counts.get("stop", 0)))
+        gain_count = max(1, int(self.metrics["routing_expected_net_gain_count"]))
+        warnings = sorted(
+            (dict(v) for v in dict(self.metrics["warnings"]).values()),
+            key=lambda x: str(x.get("code", "")),
+        )
         return {
             "flows_processed": int(self.metrics["flows_processed"]),
             "defer_count": int(self.metrics["defer_count"]),
@@ -258,6 +360,11 @@ class BAORuntime:
             "action_cost_total": float(self.metrics["action_cost_total"]),
             "utility_cost_total": float(self.metrics["utility_cost_total"]),
             "agent_utilization": agent_utilization,
-            "routing_selection_counts": dict(self.metrics["routing_selection_counts"]),
+            "routing_selection_counts": routing_counts,
+            "routing": {
+                "escalation_rate": float(routing_counts.get("escalate", 0)) / float(routing_total),
+                "avg_expected_net_gain": float(self.metrics["routing_expected_net_gain_total"]) / float(gain_count),
+            },
+            "warnings": warnings,
             "a2a": self.a2a.metadata(),
         }

@@ -10,9 +10,10 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from agents.common.calibration import fit_logistic_calibrator, logistic_probability, select_probability_threshold
+from agents.common.calibration import fit_best_calibrator
 from agents.common.preprocessing import fit_preprocessor, load_csv, schema_to_json, transform_frame
 from agents.common.training_config import load_agent_training_config
+from agents.common.versioning import collect_library_versions
 
 
 class Generator(nn.Module):
@@ -187,14 +188,26 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
     scores_train = _score_samples(critic, x_train)
     scores_cal = _score_samples(critic, x_cal)
 
-    calibrator = fit_logistic_calibrator(scores_cal, y_cal, seed=seed)
-    probs_cal = logistic_probability(scores_cal, calibrator, clip_lo=p_lo, clip_hi=p_hi)
-    threshold_prob, best_ba = select_probability_threshold(np.asarray(probs_cal), y_cal)
+    calibration_best = fit_best_calibrator(
+        scores=np.asarray(scores_cal),
+        labels=np.asarray(y_cal),
+        seed=int(seed),
+        clip_lo=float(p_lo),
+        clip_hi=float(p_hi),
+    )
+    calibrator = calibration_best["calibrator"]
+    threshold_prob = float(calibration_best["threshold_probability"])
+    best_ba = float(calibration_best["balanced_accuracy"])
+    best_ece = float(calibration_best["ece"])
+    best_brier = float(calibration_best["brier"])
+    selected_calibrator = str(calibration_best["selected"])
+    calibration_diagnostics = list(calibration_best["diagnostics"])
 
     benign = scores_cal[y_cal == 0] if np.any(y_cal == 0) else scores_cal
     malicious = scores_cal[y_cal == 1] if np.any(y_cal == 1) else scores_cal
     train_benign = scores_train[y_train == 0] if np.any(y_train == 0) else scores_train
 
+    model_versions = collect_library_versions()
     payload = {
         "generator_state_dict": generator.state_dict(),
         "critic_state_dict": critic.state_dict(),
@@ -208,6 +221,13 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "lambda_gp": float(lambda_gp),
         },
         "calibration": calibrator,
+        "selected_calibrator": selected_calibrator,
+        "calibration_diagnostics": calibration_diagnostics,
+        "calibration_metrics": {
+            "balanced_accuracy": float(best_ba),
+            "ece": float(best_ece),
+            "brier": float(best_brier),
+        },
         "threshold_probability": float(threshold_prob),
         "probability_clip": [p_lo, p_hi],
         "score_stats": {
@@ -234,6 +254,9 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "seed": int(seed),
             "validation_fraction": float(val_fraction),
             "balanced_accuracy": float(best_ba),
+            "calibration_ece": float(best_ece),
+            "calibration_brier": float(best_brier),
+            "library_versions": model_versions,
         },
     }
 

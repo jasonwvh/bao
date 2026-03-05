@@ -89,6 +89,15 @@ class BayesianBelief:
         self.var = _clip(1.0 / max(self.pooled_weight_sum, self.eps), 1e-4, 4.0)
         return self.probability()
 
+    def update_from_likelihood_ratio(self, p_obs_given_attack: float, p_obs_given_clean: float, k: float) -> float:
+        p_attack = max(self.eps, float(p_obs_given_attack))
+        p_clean = max(self.eps, float(p_obs_given_clean))
+        lr = max(self.eps, p_attack / p_clean)
+        delta = float(k) * math.log(lr)
+        self.mu = _clip(self.mu + delta, -50.0, 50.0)
+        self.var = _clip(1.0 / (1.0 + abs(delta)), 1e-4, 4.0)
+        return self.probability()
+
 
 class BeliefManager:
     def __init__(self, state: SQLiteState, eps: float = 1e-6):
@@ -119,3 +128,20 @@ class BeliefManager:
     def get_global_reliability(self, agent_id: str) -> float:
         alpha, beta = self.state.get_global_reliability(agent_id)
         return float(alpha) / float(alpha + beta)
+
+    def get_global_reliability_params(self, agent_id: str) -> tuple[float, float]:
+        alpha, beta = self.state.get_global_reliability(agent_id)
+        return float(alpha), float(beta)
+
+
+def reliability_weight_from_beta_params(
+    *,
+    alpha: float,
+    beta: float,
+    reliability_strength: float,
+) -> float:
+    denom = max(1e-9, float(alpha) + float(beta))
+    r = float(alpha) / denom
+    scaled = 2.0 * r - 1.0
+    clipped = _clip(scaled, 0.1, 2.0)
+    return max(1e-6, float(reliability_strength) * clipped)

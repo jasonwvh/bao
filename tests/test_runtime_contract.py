@@ -22,6 +22,10 @@ class _FakeA2A:
             "proba": [1.0 - p, p],
             "prediction": {"label": "malicious" if p >= 0.5 else "benign", "probability": p},
             "uncertainty": {"epistemic": ep, "aleatoric": 0.0, "total_entropy": 0.0},
+            "likelihoods": {
+                "p_obs_given_attack": max(1e-6, p),
+                "p_obs_given_clean": max(1e-6, 1.0 - p),
+            },
             "cost": float(handle.cost),
         }
 
@@ -70,7 +74,12 @@ def _write_config(path: Path, registry_path: Path, sqlite_path: Path) -> Path:
             "agent_registry_path": str(registry_path),
             "agent_sequence": ["ocsvm", "lstm_autoencoder"],
         },
-        "belief": {"prior_attack_rate": 0.5, "eps": 1e-6},
+        "belief": {
+            "prior_attack_rate": 0.5,
+            "eps": 1e-6,
+            "update_mode": "likelihood_ratio",
+            "reliability_strength": 1.0,
+        },
         "fusion": {
             "uncertainty_weight_gamma": 1.5,
             "weight_floor": 0.1,
@@ -89,9 +98,9 @@ def _write_config(path: Path, registry_path: Path, sqlite_path: Path) -> Path:
             "first_agent": "ocsvm",
             "uncertainty_threshold": 0.6,
             "max_agents": 2,
-            "min_expected_gain": -3.0,
         },
-        "voi": {"enabled": True, "rho": 0.7},
+        "voi": {"enabled": True, "rho": 0.7, "mode": "expected_cost_reduction", "min_net_gain": 0.0},
+        "metrics": {"warnings_enabled": True},
         "benchmark": {"reset_state": True, "write_manifest": True},
         "a2a": {"retries": 0},
         "state": {"sqlite_path": str(sqlite_path)},
@@ -122,6 +131,31 @@ class RuntimeContractTests(unittest.TestCase):
             self.assertIn(res["decision"], {"accept", "reject", "defer"})
             self.assertIn("combined_uncertainty", res)
             self.assertIn("agents_queried", res)
+
+    def test_missing_likelihoods_emits_warning(self) -> None:
+        class _NoLikelihoodA2A(_FakeA2A):
+            def infer(self, handle, payload):
+                out = super().infer(handle, payload)
+                out.pop("likelihoods", None)
+                return out
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            registry = _write_registry(root / "agents.yaml")
+            config = _write_config(root / "config.yaml", registry, root / "state.sqlite")
+
+            runtime = BAORuntime(str(config))
+            runtime.a2a = _NoLikelihoodA2A({"ocsvm": 0.5, "lstm_autoencoder": 0.8})
+
+            runtime.process_flow(
+                flow_features={"dur": 1.0, "spkts": 1.0, "dpkts": 1.0},
+                flow_id="flow-2",
+                timestamp=time.time(),
+                true_label=1,
+            )
+            summary = runtime.get_summary()
+            warnings = list(summary.get("warnings") or [])
+            self.assertTrue(any(w.get("code") == "missing_or_invalid_likelihoods" for w in warnings))
 
 
 if __name__ == "__main__":

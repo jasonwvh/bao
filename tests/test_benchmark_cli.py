@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import yaml
 
-import benchmark as benchmark_cli
+import main as benchmark_cli
 from orchestrator.a2a import A2AClient
 
 
@@ -66,7 +66,12 @@ def _write_config(path: Path, registry_path: Path) -> Path:
             "agent_registry_path": str(registry_path),
             "agent_sequence": ["ocsvm", "lstm_autoencoder", "wgan_gp"],
         },
-        "belief": {"prior_attack_rate": 0.5, "eps": 1e-6},
+        "belief": {
+            "prior_attack_rate": 0.5,
+            "eps": 1e-6,
+            "update_mode": "likelihood_ratio",
+            "reliability_strength": 1.0,
+        },
         "fusion": {
             "uncertainty_weight_gamma": 1.5,
             "weight_floor": 0.1,
@@ -85,9 +90,9 @@ def _write_config(path: Path, registry_path: Path) -> Path:
             "first_agent": "ocsvm",
             "uncertainty_threshold": 0.6,
             "max_agents": 3,
-            "min_expected_gain": -3.0,
         },
-        "voi": {"enabled": True, "rho": 0.7},
+        "voi": {"enabled": True, "rho": 0.7, "mode": "expected_cost_reduction", "min_net_gain": 0.0},
+        "metrics": {"warnings_enabled": True},
         "benchmark": {"reset_state": True, "write_manifest": True},
         "a2a": {"retries": 0},
         "state": {"sqlite_path": "./unused.sqlite"},
@@ -119,6 +124,10 @@ def _fake_infer(self, handle, payload):
         "proba": [1.0 - p, p],
         "prediction": {"label": "malicious" if p >= 0.5 else "benign", "probability": p},
         "uncertainty": {"epistemic": ep, "aleatoric": 0.0, "total_entropy": 0.0},
+        "likelihoods": {
+            "p_obs_given_attack": max(1e-6, p),
+            "p_obs_given_clean": max(1e-6, 1.0 - p),
+        },
         "cost": float(handle.cost),
     }
 
@@ -133,7 +142,7 @@ class BenchmarkCliTests(unittest.TestCase):
             out_root = root / "runs"
 
             argv = [
-                "benchmark.py",
+                "main.py",
                 "--mode",
                 "bao",
                 "--dataset",
@@ -165,7 +174,7 @@ class BenchmarkCliTests(unittest.TestCase):
             out_root = root / "runs"
 
             argv = [
-                "benchmark.py",
+                "main.py",
                 "--mode",
                 "all",
                 "--dataset",
@@ -185,6 +194,9 @@ class BenchmarkCliTests(unittest.TestCase):
             self.assertTrue(all("approach" in row for row in replay))
             approaches = {row["approach"] for row in replay}
             self.assertEqual(approaches, {"ocsvm", "lstm_autoencoder", "wgan_gp", "bao"})
+            benchmark = json.loads((out_root / "run_all" / "benchmark.json").read_text())
+            self.assertIn("comparison", benchmark)
+            self.assertIn("warnings", benchmark)
 
     def test_each_run_gets_new_sqlite_file(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -195,7 +207,7 @@ class BenchmarkCliTests(unittest.TestCase):
             out_root = root / "runs"
 
             argv1 = [
-                "benchmark.py",
+                "main.py",
                 "--mode",
                 "bao",
                 "--dataset",
@@ -208,7 +220,7 @@ class BenchmarkCliTests(unittest.TestCase):
                 "run_1",
             ]
             argv2 = [
-                "benchmark.py",
+                "main.py",
                 "--mode",
                 "bao",
                 "--dataset",

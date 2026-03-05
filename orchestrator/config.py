@@ -18,6 +18,8 @@ class OrchestrationConfig:
 class BeliefConfig:
     prior_attack_rate: float
     eps: float
+    update_mode: str
+    reliability_strength: float
 
 
 @dataclass(frozen=True)
@@ -43,19 +45,25 @@ class QueryConfig:
     first_agent: Optional[str]
     uncertainty_threshold: float
     max_agents: int
-    min_expected_gain: float
 
 
 @dataclass(frozen=True)
 class VOIConfig:
     enabled: bool
     rho: float
+    mode: str
+    min_net_gain: float
 
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
     reset_state: bool
     write_manifest: bool
+
+
+@dataclass(frozen=True)
+class MetricsConfig:
+    warnings_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,7 @@ class OrchestratorConfig:
     query: QueryConfig
     voi: VOIConfig
     benchmark: BenchmarkConfig
+    metrics: MetricsConfig
     state: StateConfig
     a2a: A2AConfig
     preprocessing: PreprocessingConfig
@@ -125,6 +134,13 @@ def _as_list_of_str(value: Any) -> list[str]:
     return [str(x).strip() for x in value if str(x).strip()]
 
 
+def _normalize_choice(value: Any, default: str, allowed: set[str]) -> str:
+    v = str(value if value not in (None, "") else default).strip().lower()
+    if v in allowed:
+        return v
+    return default
+
+
 def load_config(path: str | Path) -> OrchestratorConfig:
     cfg_path = Path(path).resolve()
     raw = yaml.safe_load(cfg_path.read_text()) or {}
@@ -140,6 +156,7 @@ def load_config(path: str | Path) -> OrchestratorConfig:
     query_raw = dict(raw.get("query", {}) or {})
     voi_raw = dict(raw.get("voi", {}) or {})
     benchmark_raw = dict(raw.get("benchmark", {}) or {})
+    metrics_raw = dict(raw.get("metrics", {}) or {})
     state_raw = dict(raw.get("state", {}) or {})
     a2a_raw = dict(raw.get("a2a", {}) or {})
     pre_raw = dict(raw.get("preprocessing", {}) or {})
@@ -173,6 +190,12 @@ def load_config(path: str | Path) -> OrchestratorConfig:
         belief=BeliefConfig(
             prior_attack_rate=prior,
             eps=eps,
+            update_mode=_normalize_choice(
+                belief_raw.get("update_mode", "likelihood_ratio"),
+                default="likelihood_ratio",
+                allowed={"likelihood_ratio", "probability_pool"},
+            ),
+            reliability_strength=max(0.0, _to_float(belief_raw.get("reliability_strength", 1.0), 1.0)),
         ),
         fusion=FusionConfig(
             uncertainty_weight_gamma=max(0.0, _to_float(fusion_raw.get("uncertainty_weight_gamma", 1.5), 1.5)),
@@ -198,15 +221,29 @@ def load_config(path: str | Path) -> OrchestratorConfig:
             first_agent=(str(query_raw.get("first_agent", "")).strip() or None),
             uncertainty_threshold=uncertainty_threshold,
             max_agents=max(1, _to_int(query_raw.get("max_agents", 2), 2)),
-            min_expected_gain=_to_float(query_raw.get("min_expected_gain", -3.0), -3.0),
         ),
         voi=VOIConfig(
             enabled=_to_bool(voi_raw.get("enabled", True), True),
             rho=max(0.0, min(1.0, _to_float(voi_raw.get("rho", 0.7), 0.7))),
+            mode=_normalize_choice(
+                voi_raw.get("mode", "expected_cost_reduction"),
+                default="expected_cost_reduction",
+                allowed={"expected_cost_reduction", "legacy_approx"},
+            ),
+            min_net_gain=_to_float(
+                voi_raw.get(
+                    "min_net_gain",
+                    query_raw.get("min_expected_gain", 0.0),
+                ),
+                0.0,
+            ),
         ),
         benchmark=BenchmarkConfig(
             reset_state=_to_bool(benchmark_raw.get("reset_state", True), True),
             write_manifest=_to_bool(benchmark_raw.get("write_manifest", True), True),
+        ),
+        metrics=MetricsConfig(
+            warnings_enabled=_to_bool(metrics_raw.get("warnings_enabled", True), True),
         ),
         state=StateConfig(
             sqlite_path=_resolve_path(base_dir, state_raw.get("sqlite_path"), "../artifacts/state/bao_state.sqlite")

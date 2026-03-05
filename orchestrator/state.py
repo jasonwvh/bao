@@ -49,7 +49,7 @@ class SQLiteState:
                 (agent_id,),
             ).fetchone()
         if row is None:
-            return (2.0, 1.0)
+            return (4.0, 1.0)
         return (float(row[0]), float(row[1]))
 
     def update_global_reliability(self, agent_id: str, correct: bool) -> Tuple[float, float]:

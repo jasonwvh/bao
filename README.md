@@ -1,9 +1,9 @@
 # BAO (Lean Bayesian Agent Orchestrator)
 
 Lean multi-agent orchestrator for UNSW-NB15 with:
-- Bayesian posterior updates
+- Likelihood-ratio Bayesian posterior updates (with probability-pool fallback)
 - Uncertainty-gated escalation
-- Approximate VOI query gating
+- VOI query gating via expected cost reduction
 - Cost-aware final decision (`accept|reject|defer`)
 
 ## Architecture
@@ -19,7 +19,7 @@ Lean multi-agent orchestrator for UNSW-NB15 with:
   - `orchestrator/state.py`
   - `orchestrator/data.py`
   - `orchestrator/config.py`
-- Single benchmark entrypoint: `benchmark.py`
+- Single benchmark entrypoint: `main.py`
 
 ## Quickstart
 
@@ -39,7 +39,7 @@ make health
 
 BAO only:
 ```bash
-python3 benchmark.py \
+python3 main.py \
   --mode bao \
   --dataset data/UNSW_NB15_testing-set.csv \
   --config config/orchestrator_config.utility.yaml
@@ -47,7 +47,7 @@ python3 benchmark.py \
 
 Single agent:
 ```bash
-python3 benchmark.py \
+python3 main.py \
   --mode agent \
   --agent ocsvm \
   --dataset data/UNSW_NB15_testing-set.csv \
@@ -56,7 +56,7 @@ python3 benchmark.py \
 
 All approaches in one run:
 ```bash
-python3 benchmark.py \
+python3 main.py \
   --mode all \
   --dataset data/UNSW_NB15_testing-set.csv \
   --config config/orchestrator_config.utility.yaml
@@ -83,8 +83,14 @@ There is a single decision field:
 - `decision`: `accept|reject|defer`
 
 Metrics use:
-- Classification: `compromise_prob >= 0.5`
+- Classification: `compromise_prob >= 0.5`, except `decision=defer` is counted as correct in evaluation (human adjudication).
 - Utility: realized cost from `decision`
+
+## Benchmark reporting
+`benchmark.json` includes:
+- global `warnings` (likelihood fallback, transport failures)
+- BAO `routing` stats (`escalation_rate`, `avg_expected_net_gain`)
+- `comparison` block in `--mode all` for BAO vs OCSVM vs LSTM targets
 
 ## Notes on A2A SDK
 `orchestrator/a2a.py` uses the official A2A Python SDK (`a2aproject/a2a-python`) for agent-card resolution when available, with HTTP JSON fallback for the project’s `POST /a2a/infer` contract.

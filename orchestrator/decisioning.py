@@ -45,6 +45,24 @@ def approximate_voi(p_mal: float, costs: DecisionCosts, rho: float) -> float:
     return rho_clipped * max(0.0, current - perfect)
 
 
+def expected_cost_reduction(
+    *,
+    p_mal: float,
+    costs: DecisionCosts,
+    reliability: float,
+    epistemic_uncertainty: float,
+    rho: float = 1.0,
+) -> float:
+    p = max(0.0, min(1.0, float(p_mal)))
+    rel = max(0.0, min(1.0, float(reliability)))
+    u = max(0.0, min(1.0, float(epistemic_uncertainty)))
+    rho_clipped = max(0.0, min(1.0, float(rho)))
+    current = min_expected_action_cost(p, costs)
+    perfect = perfect_information_cost(p, costs)
+    max_reduction = max(0.0, current - perfect)
+    return rho_clipped * rel * u * max_reduction
+
+
 def realized_action_cost(
     *,
     decision: Optional[str],

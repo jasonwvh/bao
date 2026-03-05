@@ -22,6 +22,7 @@ from agents.common.calibration import (
     normalize_uncertainty,
 )
 from agents.common.streaming import derive_stream_id
+from agents.common.versioning import collect_library_versions, compare_versions
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("lstm_autoencoder")
@@ -32,6 +33,7 @@ class InferContext(BaseModel):
     requested_capabilities: list[str] = Field(default_factory=list)
     seed: Optional[int] = None
     stream_id: Optional[str] = None
+    session_id: Optional[str] = None
     elicit_likelihood: Optional[bool] = True
 
 
@@ -140,6 +142,19 @@ class LSTMAutoencoderAgent:
         self.probability_clip = payload.get("probability_clip", [0.001, 0.999])
         self.p_lo = float(self.probability_clip[0])
         self.p_hi = float(self.probability_clip[1])
+        self.model_meta = dict(payload.get("meta") or {})
+        self.model_library_versions = dict(self.model_meta.get("library_versions") or {})
+        self.runtime_library_versions = collect_library_versions()
+        versions_match, version_mismatches = compare_versions(
+            expected=self.model_library_versions,
+            actual=self.runtime_library_versions,
+        )
+        self.version_check = {
+            "versions_match": bool(versions_match),
+            "mismatches": list(version_mismatches),
+        }
+        if not versions_match:
+            logger.warning("Model/service version mismatch detected: %s", "; ".join(version_mismatches))
 
     def _to_float(self, value: Any, default: float = 0.0) -> float:
         try:
@@ -217,6 +232,7 @@ class LSTMAutoencoderAgent:
         seed: Optional[int] = None,
         flow_id: Optional[str] = None,
         stream_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         del seed
         sid = derive_stream_id(
@@ -224,6 +240,8 @@ class LSTMAutoencoderAgent:
             flow_id=flow_id,
             explicit_stream_id=stream_id,
         )
+        if session_id:
+            sid = f"{session_id}:{sid}"
         n, c = self._transform_row(flow_features)
         vector = self._vectorize(n, c)
         score = self._score_flow(vector, sid)
@@ -233,16 +251,22 @@ class LSTMAutoencoderAgent:
         epistemic = class_uncertainty_from_probability(p)
         uncertainty = normalize_uncertainty(epistemic=epistemic, aleatoric=entropy)
 
-        p_obs_given_attack = self._pdf(
+        raw_attack = self._pdf(
             score,
             float(self.loss_stats.get("mal_mean", self.loss_stats.get("mean", 0.0))),
             float(self.loss_stats.get("mal_std", self.loss_stats.get("std", 1.0))),
         )
-        p_obs_given_clean = self._pdf(
+        raw_clean = self._pdf(
             score,
             float(self.loss_stats.get("benign_mean", self.loss_stats.get("mean", 0.0))),
             float(self.loss_stats.get("benign_std", self.loss_stats.get("std", 1.0))),
         )
+        raw_sum = max(1e-9, raw_attack + raw_clean)
+        score_attack = raw_attack / raw_sum
+        score_clean = raw_clean / raw_sum
+
+        p_obs_given_attack = max(1e-9, 0.7 * p + 0.3 * score_attack)
+        p_obs_given_clean = max(1e-9, 0.7 * (1.0 - p) + 0.3 * score_clean)
 
         label = "malicious" if p >= 0.5 else "benign"
         return {
@@ -264,6 +288,8 @@ class LSTMAutoencoderAgent:
                 "threshold_aligned": 0.5,
                 "stream_id": sid,
                 "window_size": int(self.window_size),
+                "raw_score_likelihood_attack": raw_attack,
+                "raw_score_likelihood_clean": raw_clean,
             },
         }
 
@@ -288,6 +314,12 @@ def capabilities() -> Dict[str, Any]:
         "agent_id": AGENT.agent_id,
         "capabilities": ["flow_tabular", "unsw_nb15", "deep_inspection", "anomaly_score", "temporal"],
         "cost": AGENT.cost,
+        "metadata": {
+            "model_type": AGENT.model_type,
+            "runtime_library_versions": AGENT.runtime_library_versions,
+            "model_library_versions": AGENT.model_library_versions,
+            "version_check": AGENT.version_check,
+        },
     }
 
 
@@ -298,6 +330,7 @@ def infer(req: InferRequest) -> Dict[str, Any]:
         seed=req.context.seed,
         flow_id=req.flow_id,
         stream_id=req.context.stream_id,
+        session_id=req.context.session_id,
     )
 
 

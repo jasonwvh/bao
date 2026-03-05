@@ -32,7 +32,7 @@ logs:
 	docker compose logs -f
 
 benchmark:
-	python3 benchmark.py --mode all --dataset data/UNSW_NB15_testing-set.csv --config config/orchestrator_config.utility.yaml
+	python3 main.py --mode all --dataset data/UNSW_NB15_testing-set.csv --config config/orchestrator_config.utility.yaml
 
 clean:
 	rm -rf artifacts/runs

@@ -6,6 +6,8 @@ orchestration:
 belief:
   prior_attack_rate: 0.5
   eps: 1.0e-6
+  update_mode: likelihood_ratio
+  reliability_strength: 1.0
 
 fusion:
   uncertainty_weight_gamma: 1.5
@@ -30,15 +32,19 @@ query:
   first_agent: ocsvm
   uncertainty_threshold: 0.56
   max_agents: 3
-  min_expected_gain: -3.20
 
 voi:
   enabled: true
   rho: 0.70
+  mode: expected_cost_reduction
+  min_net_gain: 0.0
 
 benchmark:
   reset_state: true
   write_manifest: true
+
+metrics:
+  warnings_enabled: true
 
 preprocessing:
   schema_path: ../agents/lstm_autoencoder/models/lstm_autoencoder.schema.json
