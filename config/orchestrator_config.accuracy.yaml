@@ -19,6 +19,10 @@ fusion:
 
 decision:
   costs:
+    # IPS-leaning NIDS utility model:
+    # c_fn: missed attack / malicious flow allowed through
+    # c_fp: benign flow incorrectly blocked or contained
+    # c_h: analyst review / manual triage
     c_fn: 25.0
     c_fp: 2.0
     c_h: 2.0
@@ -32,6 +36,7 @@ query:
   first_agent: ocsvm
   uncertainty_threshold: 0.56
   max_agents: 3
+  detector_cost_fraction: 0.10
 
 voi:
   enabled: true

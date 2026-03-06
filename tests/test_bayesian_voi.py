@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from orchestrator.belief import BayesianBelief, reliability_weight_from_beta_params
+from orchestrator.decisioning import DecisionCosts, expected_cost_reduction_from_likelihood_model
 from orchestrator.runtime import BAORuntime
 
 
@@ -104,11 +105,30 @@ class BayesianAndVOITests(unittest.TestCase):
         self.assertGreater(high, low)
 
     def test_voi_gate_blocks_negative_and_allows_positive_net_gain(self) -> None:
+        class _FakeA2A:
+            def capabilities(self, handle):
+                return {
+                    "agent_id": handle.agent_id,
+                    "capabilities": ["flow_tabular"],
+                    "cost": float(handle.cost),
+                    "metadata": {
+                        "likelihood_model": {
+                            "bin_edges": [0.0, 0.5, 1.0],
+                            "p_obs_given_attack_bins": [0.2, 0.8],
+                            "p_obs_given_clean_bins": [0.8, 0.2],
+                        }
+                    },
+                }
+
+            def metadata(self):
+                return {"transport": "fake"}
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             registry = _write_registry(root / "agents.yaml")
             config = _write_config(root / "config.yaml", registry, root / "state.sqlite")
             runtime = BAORuntime(str(config))
+            runtime.a2a = _FakeA2A()
 
             # Around p=0.5 this proxy has near-zero expected reduction, so net gain is negative.
             should_escalate, gain = runtime._should_escalate(  # noqa: SLF001
@@ -129,6 +149,20 @@ class BayesianAndVOITests(unittest.TestCase):
             )
             self.assertTrue(should_escalate)
             self.assertGreater(gain, 0.0)
+
+    def test_empirical_voi_reduction_uses_likelihood_bins(self) -> None:
+        reduction = expected_cost_reduction_from_likelihood_model(
+            p_mal=0.08,
+            costs=DecisionCosts(c_fn=25.0, c_fp=2.0, c_h=2.0),
+            likelihood_model={
+                "bin_edges": [0.0, 0.5, 1.0],
+                "p_obs_given_attack_bins": [0.2, 0.8],
+                "p_obs_given_clean_bins": [0.8, 0.2],
+            },
+            reliability_weight=1.0,
+            rho=1.0,
+        )
+        self.assertGreater(reduction, 0.0)
 
 
 if __name__ == "__main__":

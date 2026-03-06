@@ -32,6 +32,20 @@ class _FakeA2A:
     def metadata(self):
         return {"official_a2a_sdk_available": False, "transport": "fake"}
 
+    def capabilities(self, handle):
+        return {
+            "agent_id": handle.agent_id,
+            "capabilities": ["flow_tabular"],
+            "cost": float(handle.cost),
+            "metadata": {
+                "likelihood_model": {
+                    "bin_edges": [0.0, 0.5, 1.0],
+                    "p_obs_given_attack_bins": [0.2, 0.8],
+                    "p_obs_given_clean_bins": [0.8, 0.2],
+                }
+            },
+        }
+
 
 def _write_registry(path: Path) -> Path:
     payload = {

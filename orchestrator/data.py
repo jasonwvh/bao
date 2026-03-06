@@ -13,6 +13,7 @@ class ReplayRow(TypedDict):
     timestamp: Optional[float]
     true_label: int
     flow_features: Dict[str, Any]
+    metadata: Dict[str, Any]
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -53,8 +54,19 @@ def load_replay_dataset(path: str, max_rows: Optional[int] = None) -> List[Repla
         label = int(float(rec["label"]))
 
         features: Dict[str, Any] = {}
+        metadata: Dict[str, Any] = {}
         for key, val in rec.items():
-            if key in {"flow_id", "label", "timestamp", "id", "attack_cat"}:
+            if key in {"flow_id", "label", "timestamp", "id"}:
+                continue
+            if key in {"attack_cat", "proto", "service", "state"}:
+                if val is None:
+                    continue
+                s = str(val).strip()
+                if s:
+                    metadata[key] = s
+                if key == "attack_cat":
+                    continue
+            if key == "attack_cat":
                 continue
             f = _to_float(val)
             if f is not None:
@@ -72,6 +84,7 @@ def load_replay_dataset(path: str, max_rows: Optional[int] = None) -> List[Repla
                 timestamp=timestamp,
                 true_label=label,
                 flow_features=features,
+                metadata=metadata,
             )
         )
     return rows

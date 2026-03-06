@@ -1,4 +1,4 @@
-.PHONY: build up down train-ocsvm train-lstm-autoencoder train-wgan-gp train health logs clean benchmark
+.PHONY: build up down train-ocsvm train-lstm-autoencoder train-wgan-gp train health logs clean benchmark tune
 
 DATASET ?= data/UNSW_NB15_training-set.csv
 
@@ -33,6 +33,9 @@ logs:
 
 benchmark:
 	python3 main.py --mode all --dataset data/UNSW_NB15_testing-set.csv --config config/orchestrator_config.utility.yaml
+
+tune:
+	python3 scripts/tune_bao.py --dataset data/UNSW_NB15_testing-set.csv --config config/orchestrator_config.utility.yaml
 
 clean:
 	rm -rf artifacts/runs

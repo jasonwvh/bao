@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agents.common.streaming import derive_stream_id
-from orchestrator.a2a import A2AClient, A2AClientError, AgentHandle, load_registry
+from agents.common.likelihoods import validate_likelihood_model
+from orchestrator.a2a import A2AClient, A2AClientError, AgentHandle, calibrate_handle_costs, load_registry
 from orchestrator.belief import BeliefManager, reliability_weight_from_beta_params
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.data import DataAdapter
@@ -14,6 +15,7 @@ from orchestrator.decisioning import (
     DecisionCosts,
     approximate_voi,
     expected_cost_reduction,
+    expected_cost_reduction_from_likelihood_model,
     realized_action_cost,
     select_decision,
 )
@@ -42,10 +44,17 @@ class BAORuntime:
         self.a2a = A2AClient(retries=self.config.a2a.retries)
         self.session_id = str(uuid.uuid4())
 
-        self.agent_handles: Dict[str, AgentHandle] = load_registry(self.config.orchestration.agent_registry_path)
+        raw_handles = load_registry(self.config.orchestration.agent_registry_path)
+        self.agent_handles: Dict[str, AgentHandle] = calibrate_handle_costs(
+            raw_handles,
+            human_review_cost=self.config.decision.c_h,
+            false_positive_cost=self.config.decision.c_fp,
+            max_fraction_of_action_cost=self.config.query.detector_cost_fraction,
+        )
         self.agent_sequence = self._resolve_agent_sequence()
         if not self.agent_sequence:
             raise RuntimeError("No enabled agents found in registry")
+        self.agent_profiles: Dict[str, Dict[str, Any]] = {}
 
         self.costs = DecisionCosts(
             c_fn=float(self.config.decision.c_fn),
@@ -132,6 +141,40 @@ class BAORuntime:
     def _next_agent_reliability(self, agent_id: str) -> float:
         return max(0.0, min(1.0, float(self.beliefs.get_global_reliability(agent_id))))
 
+    def _next_agent_reliability_weight(self, agent_id: str) -> float:
+        alpha, beta = self.beliefs.get_global_reliability_params(agent_id)
+        return reliability_weight_from_beta_params(
+            alpha=alpha,
+            beta=beta,
+            reliability_strength=float(self.config.belief.reliability_strength),
+        )
+
+    def _get_agent_profile(self, agent_id: str) -> Dict[str, Any]:
+        cached = self.agent_profiles.get(agent_id)
+        if isinstance(cached, dict):
+            return cached
+
+        profile: Dict[str, Any] = {"likelihood_model": None}
+        handle = self.agent_handles.get(agent_id)
+        if handle is None:
+            self.agent_profiles[agent_id] = profile
+            return profile
+
+        try:
+            caps = self.a2a.capabilities(handle)
+            metadata = dict(caps.get("metadata") or {})
+            likelihood_model = validate_likelihood_model(metadata.get("likelihood_model"))
+            if likelihood_model is not None:
+                profile["likelihood_model"] = likelihood_model
+        except A2AClientError as exc:
+            self._record_warning(
+                "capabilities_fetch_failure",
+                f"A2A capabilities failed for {agent_id}: {exc}",
+            )
+
+        self.agent_profiles[agent_id] = profile
+        return profile
+
     def _expected_voi_value(self, p_mal: float, combined_uncertainty: float, next_agent_id: str) -> float:
         if not bool(self.config.voi.enabled):
             return 0.0
@@ -139,8 +182,25 @@ class BAORuntime:
         if mode == "legacy_approx":
             return float(approximate_voi(p_mal, self.costs, rho=float(self.config.voi.rho)))
 
+        profile = self._get_agent_profile(next_agent_id)
+        likelihood_model = profile.get("likelihood_model")
+        if isinstance(likelihood_model, dict):
+            return float(
+                expected_cost_reduction_from_likelihood_model(
+                    p_mal=p_mal,
+                    costs=self.costs,
+                    likelihood_model=likelihood_model,
+                    reliability_weight=self._next_agent_reliability_weight(next_agent_id),
+                    rho=float(self.config.voi.rho),
+                )
+            )
+
         next_rel = self._next_agent_reliability(next_agent_id)
         epistemic = max(0.0, min(1.0, float(combined_uncertainty) / math.log(2.0)))
+        self._record_warning(
+            "missing_likelihood_model",
+            f"{next_agent_id} capabilities missing likelihood_model; using heuristic VOI fallback",
+        )
         return float(
             expected_cost_reduction(
                 p_mal=p_mal,
@@ -359,6 +419,10 @@ class BAORuntime:
             "query_cost_total": float(self.metrics["query_cost_total"]),
             "action_cost_total": float(self.metrics["action_cost_total"]),
             "utility_cost_total": float(self.metrics["utility_cost_total"]),
+            "agent_costs": {
+                aid: float(handle.cost)
+                for aid, handle in self.agent_handles.items()
+            },
             "agent_utilization": agent_utilization,
             "routing_selection_counts": routing_counts,
             "routing": {

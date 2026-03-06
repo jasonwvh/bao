@@ -103,10 +103,10 @@ def _write_config(path: Path, registry_path: Path) -> Path:
 
 def _write_dataset(path: Path) -> Path:
     path.write_text(
-        "flow_id,label,dur,spkts,dpkts,sbytes,dbytes,proto,service,state\n"
-        "f1,0,1,1,2,10,20,tcp,http,FIN\n"
-        "f2,1,2,3,4,20,30,tcp,http,INT\n"
-        "f3,0,1,1,1,10,10,udp,dns,CON\n"
+        "flow_id,label,attack_cat,dur,spkts,dpkts,sbytes,dbytes,proto,service,state\n"
+        "f1,0,Normal,1,1,2,10,20,tcp,http,FIN\n"
+        "f2,1,DoS,2,3,4,20,30,tcp,http,INT\n"
+        "f3,0,Normal,1,1,1,10,10,udp,dns,CON\n"
     )
     return path
 
@@ -132,6 +132,22 @@ def _fake_infer(self, handle, payload):
     }
 
 
+def _fake_capabilities(self, handle):
+    return {
+        "agent_id": handle.agent_id,
+        "capabilities": ["flow_tabular"],
+        "cost": float(handle.cost),
+        "metadata": {
+            "threshold_probability": 0.5,
+            "likelihood_model": {
+                "bin_edges": [0.0, 0.5, 1.0],
+                "p_obs_given_attack_bins": [0.2, 0.8],
+                "p_obs_given_clean_bins": [0.8, 0.2],
+            },
+        },
+    }
+
+
 class BenchmarkCliTests(unittest.TestCase):
     def test_bao_writes_consistent_artifacts_without_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -154,7 +170,11 @@ class BenchmarkCliTests(unittest.TestCase):
                 "--run-id",
                 "run_bao",
             ]
-            with patch.object(sys, "argv", argv), patch.object(A2AClient, "infer", new=_fake_infer):
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(A2AClient, "infer", new=_fake_infer),
+                patch.object(A2AClient, "capabilities", new=_fake_capabilities),
+            ):
                 benchmark_cli.main()
 
             run_dir = out_root / "run_bao"
@@ -186,17 +206,30 @@ class BenchmarkCliTests(unittest.TestCase):
                 "--run-id",
                 "run_all",
             ]
-            with patch.object(sys, "argv", argv), patch.object(A2AClient, "infer", new=_fake_infer):
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(A2AClient, "infer", new=_fake_infer),
+                patch.object(A2AClient, "capabilities", new=_fake_capabilities),
+            ):
                 benchmark_cli.main()
 
             replay = json.loads((out_root / "run_all" / "replay_results.json").read_text())
             self.assertGreater(len(replay), 0)
             self.assertTrue(all("approach" in row for row in replay))
-            approaches = {row["approach"] for row in replay}
-            self.assertEqual(approaches, {"ocsvm", "lstm_autoencoder", "wgan_gp", "bao"})
+            self.assertTrue(all("family" in row for row in replay))
+            self.assertTrue(all("metadata" in row for row in replay))
             benchmark = json.loads((out_root / "run_all" / "benchmark.json").read_text())
             self.assertIn("comparison", benchmark)
             self.assertIn("warnings", benchmark)
+            self.assertIn("thresholded_single_agent", benchmark["results"])
+            self.assertIn("cost_aware_single_agent", benchmark["results"])
+            self.assertIn("bao", benchmark["results"])
+            bao = benchmark["results"]["bao"]
+            self.assertIn("ece", bao)
+            self.assertIn("brier", bao)
+            self.assertIn("group_metrics", bao)
+            self.assertIn("attack_cat_recall_gap", bao)
+            self.assertIn("deltas_vs_best_thresholded_single_agent", bao)
 
     def test_each_run_gets_new_sqlite_file(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -233,7 +266,10 @@ class BenchmarkCliTests(unittest.TestCase):
                 "run_2",
             ]
 
-            with patch.object(A2AClient, "infer", new=_fake_infer):
+            with (
+                patch.object(A2AClient, "infer", new=_fake_infer),
+                patch.object(A2AClient, "capabilities", new=_fake_capabilities),
+            ):
                 with patch.object(sys, "argv", argv1):
                     benchmark_cli.main()
                 with patch.object(sys, "argv", argv2):

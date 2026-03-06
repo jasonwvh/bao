@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,6 +74,27 @@ def load_registry(path: str | Path) -> Dict[str, AgentHandle]:
             agent_card_path=str(item.get("agent_card_path", "/.well-known/agent-card.json")),
         )
     return handles
+
+
+def calibrate_handle_costs(
+    handles: Dict[str, AgentHandle],
+    *,
+    human_review_cost: float,
+    false_positive_cost: float,
+    max_fraction_of_action_cost: float = 0.1,
+) -> Dict[str, AgentHandle]:
+    if not handles:
+        return {}
+
+    reference = max(
+        1e-6,
+        min(float(human_review_cost), float(false_positive_cost)) * max(1e-6, float(max_fraction_of_action_cost)),
+    )
+    raw_max = max(max(1e-6, float(handle.cost)) for handle in handles.values())
+    return {
+        agent_id: replace(handle, cost=(max(1e-6, float(handle.cost)) / raw_max) * reference)
+        for agent_id, handle in handles.items()
+    }
 
 
 class A2AClient:

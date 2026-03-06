@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class DecisionCosts:
@@ -43,6 +45,59 @@ def approximate_voi(p_mal: float, costs: DecisionCosts, rho: float) -> float:
     current = min_expected_action_cost(p_mal, costs)
     perfect = perfect_information_cost(p_mal, costs)
     return rho_clipped * max(0.0, current - perfect)
+
+
+def posterior_from_likelihood_ratio(
+    *,
+    p_mal: float,
+    p_obs_given_attack: float,
+    p_obs_given_clean: float,
+    reliability_weight: float = 1.0,
+    eps: float = 1e-9,
+) -> float:
+    p = max(float(eps), min(1.0 - float(eps), float(p_mal)))
+    attack = max(float(eps), float(p_obs_given_attack))
+    clean = max(float(eps), float(p_obs_given_clean))
+    logit_prior = math.log(p / (1.0 - p))
+    delta = float(reliability_weight) * math.log(attack / clean)
+    posterior = 1.0 / (1.0 + math.exp(-(logit_prior + delta)))
+    return max(float(eps), min(1.0 - float(eps), posterior))
+
+
+def expected_cost_reduction_from_likelihood_model(
+    *,
+    p_mal: float,
+    costs: DecisionCosts,
+    likelihood_model: Dict[str, object],
+    reliability_weight: float = 1.0,
+    rho: float = 1.0,
+    eps: float = 1e-9,
+) -> float:
+    attack_bins = np.asarray(likelihood_model.get("p_obs_given_attack_bins", []), dtype=np.float64).reshape(-1)
+    clean_bins = np.asarray(likelihood_model.get("p_obs_given_clean_bins", []), dtype=np.float64).reshape(-1)
+    if attack_bins.size == 0 or clean_bins.size == 0 or attack_bins.size != clean_bins.size:
+        return 0.0
+
+    attack_bins = np.maximum(float(eps), attack_bins)
+    clean_bins = np.maximum(float(eps), clean_bins)
+    attack_bins = attack_bins / float(np.sum(attack_bins))
+    clean_bins = clean_bins / float(np.sum(clean_bins))
+
+    p = max(float(eps), min(1.0 - float(eps), float(p_mal)))
+    current = min_expected_action_cost(p, costs)
+    future = 0.0
+    for p_attack_bin, p_clean_bin in zip(attack_bins.tolist(), clean_bins.tolist()):
+        p_obs = (p * float(p_attack_bin)) + ((1.0 - p) * float(p_clean_bin))
+        posterior = posterior_from_likelihood_ratio(
+            p_mal=p,
+            p_obs_given_attack=float(p_attack_bin),
+            p_obs_given_clean=float(p_clean_bin),
+            reliability_weight=float(reliability_weight),
+            eps=float(eps),
+        )
+        future += float(p_obs) * min_expected_action_cost(posterior, costs)
+    reduction = max(0.0, current - future)
+    return max(0.0, min(1.0, float(rho))) * reduction
 
 
 def expected_cost_reduction(

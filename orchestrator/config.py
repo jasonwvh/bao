@@ -45,6 +45,7 @@ class QueryConfig:
     first_agent: Optional[str]
     uncertainty_threshold: float
     max_agents: int
+    detector_cost_fraction: float
 
 
 @dataclass(frozen=True)
@@ -221,6 +222,7 @@ def load_config(path: str | Path) -> OrchestratorConfig:
             first_agent=(str(query_raw.get("first_agent", "")).strip() or None),
             uncertainty_threshold=uncertainty_threshold,
             max_agents=max(1, _to_int(query_raw.get("max_agents", 2), 2)),
+            detector_cost_fraction=max(1e-6, _to_float(query_raw.get("detector_cost_fraction", 0.1), 0.1)),
         ),
         voi=VOIConfig(
             enabled=_to_bool(voi_raw.get("enabled", True), True),

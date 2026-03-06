@@ -10,6 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from agents.common.calibration import fit_best_calibrator
+from agents.common.likelihoods import build_class_conditional_likelihood_model
 from agents.common.preprocessing import (
     build_sequences,
     fit_preprocessor,
@@ -324,6 +325,10 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "train_benign_mean": float(train_benign.mean()),
             "train_benign_std": float(train_benign.std() + 1e-9),
         },
+        "likelihood_model": build_class_conditional_likelihood_model(
+            scores=np.asarray(scores_cal),
+            labels=np.asarray(y_cal_seq),
+        ),
         "meta": {
             "model_type": "sequence_lstm_autoencoder",
             "dataset": str(dataset),

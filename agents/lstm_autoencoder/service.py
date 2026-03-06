@@ -21,6 +21,7 @@ from agents.common.calibration import (
     logistic_probability,
     normalize_uncertainty,
 )
+from agents.common.likelihoods import lookup_likelihoods, validate_likelihood_model
 from agents.common.streaming import derive_stream_id
 from agents.common.versioning import collect_library_versions, compare_versions
 
@@ -137,6 +138,7 @@ class LSTMAutoencoderAgent:
         self.model.eval()
 
         self.loss_stats = payload.get("loss_stats", {})
+        self.likelihood_model = validate_likelihood_model(payload.get("likelihood_model"))
         self.calibration = payload.get("calibration", {})
         self.threshold_probability = float(payload.get("threshold_probability", 0.5))
         self.probability_clip = payload.get("probability_clip", [0.001, 0.999])
@@ -251,22 +253,26 @@ class LSTMAutoencoderAgent:
         epistemic = class_uncertainty_from_probability(p)
         uncertainty = normalize_uncertainty(epistemic=epistemic, aleatoric=entropy)
 
-        raw_attack = self._pdf(
-            score,
-            float(self.loss_stats.get("mal_mean", self.loss_stats.get("mean", 0.0))),
-            float(self.loss_stats.get("mal_std", self.loss_stats.get("std", 1.0))),
-        )
-        raw_clean = self._pdf(
-            score,
-            float(self.loss_stats.get("benign_mean", self.loss_stats.get("mean", 0.0))),
-            float(self.loss_stats.get("benign_std", self.loss_stats.get("std", 1.0))),
-        )
-        raw_sum = max(1e-9, raw_attack + raw_clean)
-        score_attack = raw_attack / raw_sum
-        score_clean = raw_clean / raw_sum
-
-        p_obs_given_attack = max(1e-9, 0.7 * p + 0.3 * score_attack)
-        p_obs_given_clean = max(1e-9, 0.7 * (1.0 - p) + 0.3 * score_clean)
+        likelihood_lookup = lookup_likelihoods(score, self.likelihood_model)
+        if likelihood_lookup is not None:
+            p_obs_given_attack, p_obs_given_clean, score_bin_index = likelihood_lookup
+            raw_attack = p_obs_given_attack
+            raw_clean = p_obs_given_clean
+        else:
+            raw_attack = self._pdf(
+                score,
+                float(self.loss_stats.get("mal_mean", self.loss_stats.get("mean", 0.0))),
+                float(self.loss_stats.get("mal_std", self.loss_stats.get("std", 1.0))),
+            )
+            raw_clean = self._pdf(
+                score,
+                float(self.loss_stats.get("benign_mean", self.loss_stats.get("mean", 0.0))),
+                float(self.loss_stats.get("benign_std", self.loss_stats.get("std", 1.0))),
+            )
+            raw_sum = max(1e-9, raw_attack + raw_clean)
+            p_obs_given_attack = raw_attack / raw_sum
+            p_obs_given_clean = raw_clean / raw_sum
+            score_bin_index = -1
 
         label = "malicious" if p >= 0.5 else "benign"
         return {
@@ -288,6 +294,7 @@ class LSTMAutoencoderAgent:
                 "threshold_aligned": 0.5,
                 "stream_id": sid,
                 "window_size": int(self.window_size),
+                "score_bin_index": int(score_bin_index),
                 "raw_score_likelihood_attack": raw_attack,
                 "raw_score_likelihood_clean": raw_clean,
             },
@@ -319,6 +326,8 @@ def capabilities() -> Dict[str, Any]:
             "runtime_library_versions": AGENT.runtime_library_versions,
             "model_library_versions": AGENT.model_library_versions,
             "version_check": AGENT.version_check,
+            "threshold_probability": AGENT.threshold_probability,
+            "likelihood_model": AGENT.likelihood_model,
         },
     }
 

@@ -11,6 +11,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from agents.common.calibration import fit_best_calibrator
+from agents.common.likelihoods import build_class_conditional_likelihood_model
 from agents.common.preprocessing import fit_preprocessor, load_csv, schema_to_json, transform_frame
 from agents.common.training_config import load_agent_training_config
 from agents.common.versioning import collect_library_versions
@@ -241,6 +242,10 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "train_benign_mean": float(train_benign.mean()),
             "train_benign_std": float(train_benign.std() + 1e-9),
         },
+        "likelihood_model": build_class_conditional_likelihood_model(
+            scores=np.asarray(scores_cal),
+            labels=np.asarray(y_cal),
+        ),
         "meta": {
             "model_type": "wgan_gp",
             "dataset": str(dataset),

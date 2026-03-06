@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.svm import OneClassSVM
 
 from agents.common.calibration import fit_best_calibrator
+from agents.common.likelihoods import build_class_conditional_likelihood_model
 from agents.common.preprocessing import fit_preprocessor, load_csv, transform_frame
 from agents.common.training_config import load_agent_training_config
 from agents.common.versioning import collect_library_versions
@@ -189,6 +190,10 @@ def train(dataset: Path, output: Path, seed: int, config_path: Path | None) -> N
             "mal_std": float(np.std(malicious) + 1e-9),
         },
         "density_model": _build_density_model(best_scores),
+        "likelihood_model": build_class_conditional_likelihood_model(
+            scores=np.asarray(best_scores),
+            labels=np.asarray(y_cal),
+        ),
         "model_config": best_cfg,
         "meta": {
             "model_type": "one_class_svm",
