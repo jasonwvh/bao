@@ -223,6 +223,8 @@ class BenchmarkCliTests(unittest.TestCase):
             self.assertIn("warnings", benchmark)
             self.assertIn("thresholded_single_agent", benchmark["results"])
             self.assertIn("cost_aware_single_agent", benchmark["results"])
+            self.assertIn("thresholded_ensemble", benchmark["results"])
+            self.assertIn("cost_aware_ensemble", benchmark["results"])
             self.assertIn("bao", benchmark["results"])
             bao = benchmark["results"]["bao"]
             self.assertIn("ece", bao)
@@ -230,6 +232,48 @@ class BenchmarkCliTests(unittest.TestCase):
             self.assertIn("group_metrics", bao)
             self.assertIn("attack_cat_recall_gap", bao)
             self.assertIn("deltas_vs_best_thresholded_single_agent", bao)
+            self.assertIn("average_probability", benchmark["results"]["thresholded_ensemble"])
+            self.assertIn("majority_vote", benchmark["results"]["thresholded_ensemble"])
+
+    def test_ensemble_mode_writes_static_ensemble_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dataset = _write_dataset(root / "dataset.csv")
+            registry = _write_registry(root / "agents.yaml")
+            config = _write_config(root / "config.yaml", registry)
+            out_root = root / "runs"
+
+            argv = [
+                "main.py",
+                "--mode",
+                "ensemble",
+                "--ensemble-method",
+                "average_probability",
+                "--baseline-family",
+                "thresholded_single_agent",
+                "--dataset",
+                str(dataset),
+                "--config",
+                str(config),
+                "--output-dir",
+                str(out_root),
+                "--run-id",
+                "run_ensemble",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(A2AClient, "infer", new=_fake_infer),
+                patch.object(A2AClient, "capabilities", new=_fake_capabilities),
+            ):
+                benchmark_cli.main()
+
+            benchmark = json.loads((out_root / "run_ensemble" / "benchmark.json").read_text())
+            replay = json.loads((out_root / "run_ensemble" / "replay_results.json").read_text())
+            self.assertEqual(benchmark["approach"], "average_probability")
+            self.assertEqual(benchmark["family"], "thresholded_ensemble")
+            self.assertIn("ece", benchmark)
+            self.assertIn("brier", benchmark)
+            self.assertTrue(all("agent_probabilities" in row for row in replay))
 
     def test_each_run_gets_new_sqlite_file(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -27,14 +27,17 @@ from orchestrator.state import SQLiteState
 
 
 AGENT_CHOICES = ["ocsvm", "lstm_autoencoder", "wgan_gp"]
-MODE_CHOICES = ["bao", "agent", "all"]
+ENSEMBLE_CHOICES = ["average_probability", "majority_vote"]
+MODE_CHOICES = ["bao", "agent", "ensemble", "all"]
 BASELINE_FAMILIES = ["thresholded_single_agent", "cost_aware_single_agent"]
+ENSEMBLE_FAMILIES = ["thresholded_ensemble", "cost_aware_ensemble"]
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Lean BAO benchmark entrypoint")
     p.add_argument("--mode", choices=MODE_CHOICES, default="bao")
     p.add_argument("--agent", choices=AGENT_CHOICES, default=None)
+    p.add_argument("--ensemble-method", choices=ENSEMBLE_CHOICES, default="average_probability")
     p.add_argument("--baseline-family", choices=BASELINE_FAMILIES, default="cost_aware_single_agent")
     p.add_argument("--dataset", default="data/UNSW_NB15_testing-set.csv")
     p.add_argument("--config", default="config/orchestrator_config.utility.yaml")
@@ -196,6 +199,108 @@ def _run_agent_baseline(
     )
 
 
+def _ensemble_probability(*, method: str, agent_probabilities: Dict[str, float]) -> float:
+    probs = [float(agent_probabilities[agent_id]) for agent_id in AGENT_CHOICES]
+    if str(method) == "majority_vote":
+        votes = [1.0 if p >= 0.5 else 0.0 for p in probs]
+        return float(sum(votes) / float(len(votes)))
+    return float(sum(probs) / float(len(probs)))
+
+
+def _run_ensemble_baseline(
+    *,
+    method: str,
+    rows: List[Dict[str, Any]],
+    cfg: OrchestratorConfig,
+    family: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    handles = _load_calibrated_handles(cfg)
+    missing = [agent_id for agent_id in AGENT_CHOICES if agent_id not in handles]
+    if missing:
+        raise RuntimeError(f"Agents not enabled in registry for ensemble: {', '.join(sorted(missing))}")
+
+    data_adapter = DataAdapter(schema_path=cfg.preprocessing.schema_path)
+    a2a = A2AClient(retries=cfg.a2a.retries)
+    costs = DecisionCosts(c_fn=cfg.decision.c_fn, c_fp=cfg.decision.c_fp, c_h=cfg.decision.c_h)
+    acc = MetricsAccumulator(costs=costs)
+    warnings: Dict[str, Dict[str, Any]] = {}
+    session_id = f"ensemble-{family}-{method}-{uuid.uuid4().hex[:8]}"
+
+    replay_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        features = data_adapter.transform(dict(row["flow_features"]))
+        payload = _build_payload(
+            {
+                "flow_id": row["flow_id"],
+                "timestamp": row.get("timestamp"),
+                "flow_features": features,
+            },
+            session_id=session_id,
+        )
+        query_cost = 0.0
+        error_messages: Dict[str, str] = {}
+        agent_probabilities: Dict[str, float] = {}
+
+        for agent_id in AGENT_CHOICES:
+            handle = handles[agent_id]
+            agent_query_cost = float(handle.cost)
+            try:
+                out = a2a.infer(handle, payload)
+                p = float((out.get("proba") or [0.5, 0.5])[1])
+            except A2AClientError as exc:
+                p = 0.5
+                agent_query_cost = 0.0
+                error_messages[agent_id] = str(exc)
+                key = f"{agent_id}_transport_failure"
+                current = warnings.get(key)
+                if current is None:
+                    warnings[key] = {
+                        "code": key,
+                        "message": f"{agent_id} infer transport failure",
+                        "count": 1,
+                    }
+                else:
+                    current["count"] = int(current["count"]) + 1
+            agent_probabilities[agent_id] = p
+            query_cost += agent_query_cost
+
+        probability = _ensemble_probability(method=method, agent_probabilities=agent_probabilities)
+        decision = _select_baseline_decision(family=family, probability=probability, costs=costs)
+        acc.add(
+            true_label=int(row["true_label"]),
+            probability=probability,
+            decision=decision,
+            query_cost=query_cost,
+            metadata=dict(row.get("metadata") or {}),
+        )
+
+        replay_row = {
+            "family": family,
+            "approach": method,
+            "flow_id": row["flow_id"],
+            "true_label": int(row["true_label"]),
+            "decision": decision,
+            "probability": float(probability),
+            "prediction": evaluation_prediction(
+                probability=float(probability),
+                decision=decision,
+                true_label=int(row["true_label"]),
+            ),
+            "query_cost": query_cost,
+            "agent_probabilities": {agent_id: float(agent_probabilities[agent_id]) for agent_id in AGENT_CHOICES},
+            "metadata": dict(row.get("metadata") or {}),
+        }
+        if error_messages:
+            replay_row["agent_errors"] = error_messages
+        replay_rows.append(replay_row)
+
+    return (
+        replay_rows,
+        acc.compute(approach=method, family=family),
+        sorted(warnings.values(), key=lambda x: str(x["code"])),
+    )
+
+
 def _run_bao(*, rows: List[Dict[str, Any]], runtime: BAORuntime) -> tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     costs = DecisionCosts(c_fn=runtime.config.decision.c_fn, c_fp=runtime.config.decision.c_fp, c_h=runtime.config.decision.c_h)
     acc = MetricsAccumulator(costs=costs)
@@ -310,9 +415,23 @@ def main() -> None:
         merge_warnings(warnings)
         benchmark_payload = metrics
 
+    elif args.mode == "ensemble":
+        family = "thresholded_ensemble" if str(args.baseline_family) == "thresholded_single_agent" else "cost_aware_ensemble"
+        replay_rows, metrics, warnings = _run_ensemble_baseline(
+            method=str(args.ensemble_method),
+            rows=rows,
+            cfg=cfg,
+            family=family,
+        )
+        replay_results.extend(replay_rows)
+        merge_warnings(warnings)
+        benchmark_payload = metrics
+
     else:
         thresholded_results: Dict[str, Dict[str, Any]] = {}
         cost_aware_results: Dict[str, Dict[str, Any]] = {}
+        thresholded_ensemble_results: Dict[str, Dict[str, Any]] = {}
+        cost_aware_ensemble_results: Dict[str, Dict[str, Any]] = {}
 
         for aid in AGENT_CHOICES:
             for family, target in (
@@ -322,6 +441,16 @@ def main() -> None:
                 replay_rows, metrics, warnings = _run_agent_baseline(agent_id=aid, rows=rows, cfg=cfg, family=family)
                 replay_results.extend(replay_rows)
                 target[aid] = metrics
+                merge_warnings(warnings)
+
+        for method in ENSEMBLE_CHOICES:
+            for family, target in (
+                ("thresholded_ensemble", thresholded_ensemble_results),
+                ("cost_aware_ensemble", cost_aware_ensemble_results),
+            ):
+                replay_rows, metrics, warnings = _run_ensemble_baseline(method=method, rows=rows, cfg=cfg, family=family)
+                replay_results.extend(replay_rows)
+                target[method] = metrics
                 merge_warnings(warnings)
 
         runtime = BAORuntime(cfg, state_sqlite_path=sqlite_path)
@@ -340,6 +469,8 @@ def main() -> None:
             "results": {
                 "thresholded_single_agent": thresholded_results,
                 "cost_aware_single_agent": cost_aware_results,
+                "thresholded_ensemble": thresholded_ensemble_results,
+                "cost_aware_ensemble": cost_aware_ensemble_results,
                 "bao": bao_metrics,
             },
             "bao_summary": bao_summary,
@@ -360,6 +491,7 @@ def main() -> None:
         "created_at_unix": time.time(),
         "mode": args.mode,
         "agent": args.agent,
+        "ensemble_method": args.ensemble_method,
         "baseline_family": args.baseline_family,
         "dataset_path": str(Path(args.dataset).resolve()),
         "dataset_sha256": _sha256(Path(args.dataset).resolve()),
